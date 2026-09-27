@@ -11,9 +11,10 @@ are ignored; every non-negative token is one cache lookup in the hit-rate
 denominator.
 
 Use ``--start-line`` to analyze exactly one contiguous request instance.  This
-mode is useful for logs in which a request id is reused: it stops before the
-next request block (or before a decode-round reset of the same request id) and
-prints ``next_start_line`` for the next invocation.
+mode is useful for logs in which a request id is reused: after finding the
+first top-k record, the first ordinary log line terminates the contiguous
+request block. A changed request id or a decode-round reset is used only as a
+fallback boundary when no ordinary line separates two blocks.
 """
 
 from __future__ import annotations
@@ -614,10 +615,11 @@ def analyze_one_request(
 ) -> Tuple[int, int, RequestWindow]:
     """Analyze the first complete contiguous request block at/after a line.
 
-    A block is identified by ``(rank, rid, req_pool_idx)``.  It ends before the
-    first record with a different identity.  A reused identical identity is
-    detected when any layer's decode round or sequence length stops increasing.
-    Non-matching ordinary log lines are included in the consumed window.
+    Before the first top-k record, ordinary log lines are skipped.  After the
+    first record, the first ordinary log line terminates the block.  Rank and
+    request-pool changes do not terminate a block.  A changed request id or a
+    non-increasing round/sequence for the same rank and layer is retained as a
+    fallback boundary for logs that have no ordinary separator line.
     """
 
     if start_line < 1:
@@ -643,6 +645,34 @@ def analyze_one_request(
             raise ValueError("{}:{}: {}".format(path, line_number, exc)) from exc
 
         if record is None:
+            if request_identity is not None:
+                assert first_record_line is not None
+                if progress is not None:
+                    progress.finish(
+                        path,
+                        line_number - 1,
+                        scanned_lines - 1,
+                        matched_lines,
+                        ignored_lines,
+                        last_record,
+                        request_layer_count=len(analyzed_layers),
+                        request_round_count=len(analyzed_rounds),
+                        request_record_count=matched_lines,
+                    )
+                return (
+                    matched_lines,
+                    ignored_lines,
+                    RequestWindow(
+                        path=path,
+                        requested_start_line=start_line,
+                        first_record_line=first_record_line,
+                        end_line=line_number - 1,
+                        next_start_line=line_number,
+                        rank=request_identity[0],
+                        rid=request_identity[1],
+                        req_pool_idx=request_identity[2],
+                    ),
+                )
             ignored_lines += 1
             if progress is not None:
                 progress.update(
@@ -662,7 +692,11 @@ def analyze_one_request(
         if request_identity is None:
             request_identity = identity
             first_record_line = line_number
-        elif identity != request_identity:
+        elif (
+            record.rid != "unknown"
+            and request_identity[1] != "unknown"
+            and record.request_key != request_identity[1]
+        ):
             assert first_record_line is not None
             if progress is not None:
                 progress.finish(
