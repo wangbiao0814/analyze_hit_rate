@@ -9,6 +9,11 @@ The input is the eager-mode log emitted by ``SparseKVCacheManager``::
 State is isolated by ``(rank, rid, layer_id)``. Negative top-k padding values
 are ignored; every non-negative token is one cache lookup in the hit-rate
 denominator.
+
+Use ``--start-line`` to analyze exactly one contiguous request instance.  This
+mode is useful for logs in which a request id is reused: it stops before the
+next request block (or before a decode-round reset of the same request id) and
+prints ``next_start_line`` for the next invocation.
 """
 
 from __future__ import annotations
@@ -19,6 +24,7 @@ import csv
 import gzip
 import re
 import sys
+import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import (
@@ -99,6 +105,142 @@ class HitRateStats:
         if self.accesses == 0:
             return 0.0
         return self.hits / self.accesses
+
+
+@dataclass(frozen=True)
+class RequestWindow:
+    """The inclusive log window consumed for one request instance."""
+
+    path: str
+    requested_start_line: int
+    first_record_line: int
+    end_line: int
+    next_start_line: int
+    rank: int
+    rid: str
+    req_pool_idx: int
+
+
+class ProgressReporter:
+    """Dependency-free progress output that keeps report stdout clean."""
+
+    _SPINNER = "|/-\\"
+
+    def __init__(
+        self,
+        every: int = 1000,
+        output: TextIO = sys.stderr,
+    ) -> None:
+        if every <= 0:
+            raise ValueError("progress interval must be positive")
+        self.every = every
+        self.output = output
+        self.started_at = time.monotonic()
+        self._last_width = 0
+        self._last_state: Optional[Tuple[str, int, int, int, int]] = None
+
+    def update(
+        self,
+        path: str,
+        line_number: int,
+        scanned_lines: int,
+        matched_lines: int,
+        ignored_lines: int,
+        record: Optional[TopKRecord],
+        force: bool = False,
+        request_layer_count: Optional[int] = None,
+        request_round_count: Optional[int] = None,
+        request_record_count: Optional[int] = None,
+    ) -> None:
+        if not force and scanned_lines % self.every != 0:
+            return
+
+        state = (
+            path,
+            line_number,
+            scanned_lines,
+            matched_lines,
+            ignored_lines,
+        )
+        if force and state == self._last_state:
+            return
+
+        elapsed = max(time.monotonic() - self.started_at, 1e-9)
+        rate = scanned_lines / elapsed
+        spinner = self._SPINNER[(scanned_lines // self.every) % len(self._SPINNER)]
+        detail = "waiting_for_request"
+        if record is not None:
+            detail = "rid={} layer={} round={} seq_len={}".format(
+                record.request_key,
+                record.layer_id,
+                record.decode_round,
+                record.seq_len,
+            )
+            if (
+                request_layer_count is not None
+                and request_round_count is not None
+                and request_record_count is not None
+            ):
+                detail = (
+                    "request={} analyzed_layers={} analyzed_decode_rounds={} "
+                    "topk_records={} current_layer={} current_round={} seq_len={}"
+                ).format(
+                    record.request_key,
+                    request_layer_count,
+                    request_round_count,
+                    request_record_count,
+                    record.layer_id,
+                    record.decode_round,
+                    record.seq_len,
+                )
+        message = (
+            "{} analyzing path={} line={} scanned={} records={} ignored={} "
+            "rate={:.0f} lines/s {}"
+        ).format(
+            spinner,
+            path,
+            line_number,
+            scanned_lines,
+            matched_lines,
+            ignored_lines,
+            rate,
+            detail,
+        )
+
+        if self.output.isatty():
+            padding = " " * max(0, self._last_width - len(message))
+            print("\r{}{}".format(message, padding), end="", file=self.output, flush=True)
+            self._last_width = len(message)
+        else:
+            print(message, file=self.output, flush=True)
+        self._last_state = state
+
+    def finish(
+        self,
+        path: str,
+        line_number: int,
+        scanned_lines: int,
+        matched_lines: int,
+        ignored_lines: int,
+        record: Optional[TopKRecord],
+        request_layer_count: Optional[int] = None,
+        request_round_count: Optional[int] = None,
+        request_record_count: Optional[int] = None,
+    ) -> None:
+        self.update(
+            path,
+            line_number,
+            scanned_lines,
+            matched_lines,
+            ignored_lines,
+            record,
+            force=True,
+            request_layer_count=request_layer_count,
+            request_round_count=request_round_count,
+            request_record_count=request_record_count,
+        )
+        if self.output.isatty():
+            print(file=self.output)
 
 
 class CachePolicy(Protocol):
@@ -388,37 +530,254 @@ class HitRateAnalyzer:
             request_layer_stats[name].add(hits, misses)
 
 
-def _iter_lines(path: str) -> Iterator[Tuple[int, str]]:
+def _iter_lines(path: str, start_line: int = 1) -> Iterator[Tuple[int, str]]:
+    if start_line < 1:
+        raise ValueError("start_line must be >= 1")
     if path == "-":
         for line_number, line in enumerate(sys.stdin, start=1):
-            yield line_number, line
+            if line_number >= start_line:
+                yield line_number, line
         return
 
     opener = gzip.open if path.endswith(".gz") else open
     with opener(path, "rt", encoding="utf-8", errors="replace") as file:
         for line_number, line in enumerate(file, start=1):
-            yield line_number, line
+            if line_number >= start_line:
+                yield line_number, line
 
 
-def analyze_logs(paths: Sequence[str], analyzer: HitRateAnalyzer) -> Tuple[int, int]:
+def analyze_logs(
+    paths: Sequence[str],
+    analyzer: HitRateAnalyzer,
+    progress: Optional[ProgressReporter] = None,
+) -> Tuple[int, int]:
     matched_lines = 0
     ignored_lines = 0
+    scanned_lines = 0
+    last_path = paths[-1] if paths else ""
+    last_line_number = 0
+    last_record: Optional[TopKRecord] = None
     stdin_count = sum(path == "-" for path in paths)
     if stdin_count > 1:
         raise ValueError("stdin ('-') may be specified only once")
 
     for path in paths:
         for line_number, line in _iter_lines(path):
+            scanned_lines += 1
+            last_path = path
+            last_line_number = line_number
             try:
                 record = parse_log_line(line)
                 if record is None:
                     ignored_lines += 1
+                    if progress is not None:
+                        progress.update(
+                            path,
+                            line_number,
+                            scanned_lines,
+                            matched_lines,
+                            ignored_lines,
+                            last_record,
+                        )
                     continue
                 analyzer.process(record)
                 matched_lines += 1
+                last_record = record
+                if progress is not None:
+                    progress.update(
+                        path,
+                        line_number,
+                        scanned_lines,
+                        matched_lines,
+                        ignored_lines,
+                        last_record,
+                    )
             except (SyntaxError, ValueError) as exc:
                 raise ValueError("{}:{}: {}".format(path, line_number, exc)) from exc
+    if progress is not None:
+        progress.finish(
+            last_path,
+            last_line_number,
+            scanned_lines,
+            matched_lines,
+            ignored_lines,
+            last_record,
+        )
     return matched_lines, ignored_lines
+
+
+def analyze_one_request(
+    path: str,
+    analyzer: HitRateAnalyzer,
+    start_line: int,
+    progress: Optional[ProgressReporter] = None,
+) -> Tuple[int, int, RequestWindow]:
+    """Analyze the first complete contiguous request block at/after a line.
+
+    A block is identified by ``(rank, rid, req_pool_idx)``.  It ends before the
+    first record with a different identity.  A reused identical identity is
+    detected when any layer's decode round or sequence length stops increasing.
+    Non-matching ordinary log lines are included in the consumed window.
+    """
+
+    if start_line < 1:
+        raise ValueError("--start-line must be >= 1")
+
+    matched_lines = 0
+    ignored_lines = 0
+    scanned_lines = 0
+    first_record_line: Optional[int] = None
+    last_seen_line = start_line - 1
+    last_record: Optional[TopKRecord] = None
+    request_identity: Optional[Tuple[int, str, int]] = None
+    last_by_layer: Dict[Tuple[int, int], Tuple[int, int]] = {}
+    analyzed_layers = set()
+    analyzed_rounds = set()
+
+    for line_number, line in _iter_lines(path, start_line=start_line):
+        scanned_lines += 1
+        last_seen_line = line_number
+        try:
+            record = parse_log_line(line)
+        except (SyntaxError, ValueError) as exc:
+            raise ValueError("{}:{}: {}".format(path, line_number, exc)) from exc
+
+        if record is None:
+            ignored_lines += 1
+            if progress is not None:
+                progress.update(
+                    path,
+                    line_number,
+                    scanned_lines,
+                    matched_lines,
+                    ignored_lines,
+                    last_record,
+                    request_layer_count=len(analyzed_layers),
+                    request_round_count=len(analyzed_rounds),
+                    request_record_count=matched_lines,
+                )
+            continue
+
+        identity = (record.rank, record.request_key, record.req_pool_idx)
+        if request_identity is None:
+            request_identity = identity
+            first_record_line = line_number
+        elif identity != request_identity:
+            assert first_record_line is not None
+            if progress is not None:
+                progress.finish(
+                    path,
+                    line_number - 1,
+                    scanned_lines - 1,
+                    matched_lines,
+                    ignored_lines,
+                    last_record,
+                    request_layer_count=len(analyzed_layers),
+                    request_round_count=len(analyzed_rounds),
+                    request_record_count=matched_lines,
+                )
+            return (
+                matched_lines,
+                ignored_lines,
+                RequestWindow(
+                    path=path,
+                    requested_start_line=start_line,
+                    first_record_line=first_record_line,
+                    end_line=line_number - 1,
+                    next_start_line=line_number,
+                    rank=request_identity[0],
+                    rid=request_identity[1],
+                    req_pool_idx=request_identity[2],
+                ),
+            )
+
+        layer_key = (record.rank, record.layer_id)
+        previous = last_by_layer.get(layer_key)
+        if previous is not None and (
+            record.decode_round <= previous[0] or record.seq_len <= previous[1]
+        ):
+            assert request_identity is not None
+            assert first_record_line is not None
+            if progress is not None:
+                progress.finish(
+                    path,
+                    line_number - 1,
+                    scanned_lines - 1,
+                    matched_lines,
+                    ignored_lines,
+                    last_record,
+                    request_layer_count=len(analyzed_layers),
+                    request_round_count=len(analyzed_rounds),
+                    request_record_count=matched_lines,
+                )
+            return (
+                matched_lines,
+                ignored_lines,
+                RequestWindow(
+                    path=path,
+                    requested_start_line=start_line,
+                    first_record_line=first_record_line,
+                    end_line=line_number - 1,
+                    next_start_line=line_number,
+                    rank=request_identity[0],
+                    rid=request_identity[1],
+                    req_pool_idx=request_identity[2],
+                ),
+            )
+
+        analyzer.process(record)
+        last_by_layer[layer_key] = (record.decode_round, record.seq_len)
+        analyzed_layers.add(layer_key)
+        analyzed_rounds.add(record.decode_round)
+        matched_lines += 1
+        last_record = record
+        if progress is not None:
+            progress.update(
+                path,
+                line_number,
+                scanned_lines,
+                matched_lines,
+                ignored_lines,
+                last_record,
+                request_layer_count=len(analyzed_layers),
+                request_round_count=len(analyzed_rounds),
+                request_record_count=matched_lines,
+            )
+
+    if request_identity is None or first_record_line is None:
+        raise ValueError(
+            "no SPARSE_KV_DECODE_TOPK records found at or after line {}".format(
+                start_line
+            )
+        )
+
+    if progress is not None:
+        progress.finish(
+            path,
+            last_seen_line,
+            scanned_lines,
+            matched_lines,
+            ignored_lines,
+            last_record,
+            request_layer_count=len(analyzed_layers),
+            request_round_count=len(analyzed_rounds),
+            request_record_count=matched_lines,
+        )
+
+    return (
+        matched_lines,
+        ignored_lines,
+        RequestWindow(
+            path=path,
+            requested_start_line=start_line,
+            first_record_line=first_record_line,
+            end_line=last_seen_line,
+            next_start_line=last_seen_line + 1,
+            rank=request_identity[0],
+            rid=request_identity[1],
+            req_pool_idx=request_identity[2],
+        ),
+    )
 
 
 def _print_stats_group(
@@ -496,6 +855,26 @@ def print_report(
             )
         ),
         output,
+    )
+
+
+def print_request_window(
+    window: RequestWindow, output: TextIO = sys.stdout
+) -> None:
+    print(
+        "request_instance path={} rank={} rid={} req_pool_idx={} "
+        "requested_start_line={} first_record_line={} end_line={} "
+        "next_start_line={}".format(
+            window.path,
+            window.rank,
+            window.rid,
+            window.req_pool_idx,
+            window.requested_start_line,
+            window.first_record_line,
+            window.end_line,
+            window.next_start_line,
+        ),
+        file=output,
     )
 
 
@@ -581,6 +960,27 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="strategy-2/3/4 capacity (default: 4096)",
     )
     parser.add_argument(
+        "--start-line",
+        type=int,
+        metavar="N",
+        help=(
+            "analyze one contiguous request instance starting at or after "
+            "1-based line N, then print next_start_line"
+        ),
+    )
+    parser.add_argument(
+        "--progress-every",
+        type=int,
+        default=1000,
+        metavar="N",
+        help="refresh progress after every N scanned lines (default: 1000)",
+    )
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="disable progress output on stderr",
+    )
+    parser.add_argument(
         "--details",
         action="store_true",
         help="also print per-request and per-request-layer tables",
@@ -596,17 +996,34 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
     try:
+        window: Optional[RequestWindow] = None
+        progress = (
+            None
+            if args.no_progress
+            else ProgressReporter(every=args.progress_every)
+        )
         analyzer = HitRateAnalyzer(
             topk_capacity=args.topk_capacity,
             device_capacity=args.device_capacity,
             probation_age=args.probation_age,
         )
-        matched_lines, ignored_lines = analyze_logs(args.logs, analyzer)
+        if args.start_line is not None:
+            if len(args.logs) != 1:
+                raise ValueError("--start-line requires exactly one log file")
+            matched_lines, ignored_lines, window = analyze_one_request(
+                args.logs[0], analyzer, args.start_line, progress=progress
+            )
+        else:
+            matched_lines, ignored_lines = analyze_logs(
+                args.logs, analyzer, progress=progress
+            )
         if matched_lines == 0:
             raise ValueError("no SPARSE_KV_DECODE_TOPK records found")
         print_report(analyzer, matched_lines, ignored_lines, args.details)
         if args.csv:
             write_csv_report(args.csv, analyzer)
+        if window is not None:
+            print_request_window(window)
     except (OSError, ValueError) as exc:
         print("error: {}".format(exc), file=sys.stderr)
         return 2
