@@ -10,11 +10,11 @@ State is isolated by ``(rank, rid, layer_id)``. Negative top-k padding values
 are ignored; every non-negative token is one cache lookup in the hit-rate
 denominator.
 
-Use ``--start-line`` to analyze exactly one contiguous request instance.  This
-mode is useful for logs in which a request id is reused: after finding the
-first top-k record, the first ordinary log line terminates the contiguous
-request block. A changed request id or a decode-round reset is used only as a
-fallback boundary when no ordinary line separates two blocks.
+Use ``--start-line`` to begin at a specific log position. By default only the
+first contiguous request instance is analyzed; ``--all-requests`` processes
+every later block in one sequential scan. This is useful for logs in which a
+request id is reused: ordinary log lines are skipped, while a changed request
+id or a decode-round/sequence-length reset terminates the current instance.
 """
 
 from __future__ import annotations
@@ -29,6 +29,7 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import (
+    Callable,
     Dict,
     Iterable,
     Iterator,
@@ -619,12 +620,11 @@ def analyze_one_request(
 ) -> Tuple[int, int, RequestWindow]:
     """Analyze the first complete contiguous request block at/after a line.
 
-    Before the first top-k record, ordinary log lines are skipped.  After the
-    first record, the first ordinary log line terminates the block.  Rank and
+    Ordinary log lines are skipped both before and during a request. Rank and
     request-pool changes do not terminate a block. Only one rank is analyzed:
     ``rank_filter`` when supplied, otherwise the first rank in the block. A
-    changed request id or a non-increasing round/sequence is retained as a
-    fallback boundary for logs that have no ordinary separator line.
+    changed request id or a non-increasing round/sequence for the selected
+    rank terminates the current request instance.
     """
 
     if start_line < 1:
@@ -651,34 +651,6 @@ def analyze_one_request(
             raise ValueError("{}:{}: {}".format(path, line_number, exc)) from exc
 
         if record is None:
-            if request_identity is not None:
-                assert first_record_line is not None
-                if progress is not None:
-                    progress.finish(
-                        path,
-                        line_number - 1,
-                        scanned_lines - 1,
-                        matched_lines,
-                        ignored_lines,
-                        last_record,
-                        request_layer_count=len(analyzed_layers),
-                        request_round_count=len(analyzed_rounds),
-                        request_record_count=matched_lines,
-                    )
-                return (
-                    matched_lines,
-                    ignored_lines,
-                    RequestWindow(
-                        path=path,
-                        requested_start_line=start_line,
-                        first_record_line=first_record_line,
-                        end_line=line_number - 1,
-                        next_start_line=line_number,
-                        rank=selected_rank,
-                        rid=request_identity[1],
-                        req_pool_idx=request_identity[2],
-                    ),
-                )
             ignored_lines += 1
             if progress is not None:
                 progress.update(
@@ -836,6 +808,182 @@ def analyze_one_request(
             req_pool_idx=request_identity[2],
         ),
     )
+
+
+def analyze_all_request_blocks(
+    path: str,
+    analyzer_factory: Callable[[], HitRateAnalyzer],
+    start_line: int = 1,
+    progress: Optional[ProgressReporter] = None,
+    rank_filter: Optional[int] = None,
+) -> Iterator[Tuple[HitRateAnalyzer, int, int, RequestWindow]]:
+    """Analyze every contiguous top-k request block in one sequential scan."""
+
+    if start_line < 1:
+        raise ValueError("--start-line must be >= 1")
+
+    analyzer: Optional[HitRateAnalyzer] = None
+    request_identity: Optional[Tuple[int, str, int]] = None
+    selected_rank: Optional[int] = rank_filter
+    block_search_start = start_line
+    first_record_line: Optional[int] = None
+    last_record: Optional[TopKRecord] = None
+    last_by_layer: Dict[Tuple[int, int], Tuple[int, int]] = {}
+    analyzed_layers = set()
+    analyzed_rounds = set()
+    matched_lines = 0
+    ignored_lines = 0
+    scanned_lines = 0
+    last_seen_line = start_line - 1
+
+    def make_result(end_line: int, next_start_line: int):
+        assert analyzer is not None
+        assert request_identity is not None
+        assert selected_rank is not None
+        assert first_record_line is not None
+        return (
+            analyzer,
+            matched_lines,
+            ignored_lines,
+            RequestWindow(
+                path=path,
+                requested_start_line=block_search_start,
+                first_record_line=first_record_line,
+                end_line=end_line,
+                next_start_line=next_start_line,
+                rank=selected_rank,
+                rid=request_identity[1],
+                req_pool_idx=request_identity[2],
+            ),
+        )
+
+    for line_number, line in _iter_lines(path, start_line=start_line):
+        scanned_lines += 1
+        last_seen_line = line_number
+        try:
+            record = parse_log_line(line)
+        except (SyntaxError, ValueError) as exc:
+            raise ValueError("{}:{}: {}".format(path, line_number, exc)) from exc
+
+        if record is None:
+            ignored_lines += 1
+            if progress is not None:
+                progress.update(
+                    path,
+                    line_number,
+                    scanned_lines,
+                    matched_lines,
+                    ignored_lines,
+                    last_record,
+                    request_layer_count=(
+                        len(analyzed_layers) if analyzer is not None else None
+                    ),
+                    request_round_count=(
+                        len(analyzed_rounds) if analyzer is not None else None
+                    ),
+                    request_record_count=(
+                        matched_lines if analyzer is not None else None
+                    ),
+                )
+            continue
+
+        identity = (record.rank, record.request_key, record.req_pool_idx)
+        rid_changed = (
+            request_identity is not None
+            and record.rid != "unknown"
+            and request_identity[1] != "unknown"
+            and record.request_key != request_identity[1]
+        )
+        round_restarted = False
+        if analyzer is not None and selected_rank == record.rank:
+            previous = last_by_layer.get((record.rank, record.layer_id))
+            round_restarted = previous is not None and (
+                record.decode_round <= previous[0] or record.seq_len <= previous[1]
+            )
+
+        if analyzer is not None and (rid_changed or round_restarted):
+            if progress is not None:
+                progress.finish(
+                    path,
+                    line_number - 1,
+                    scanned_lines - 1,
+                    matched_lines,
+                    ignored_lines,
+                    last_record,
+                    request_layer_count=len(analyzed_layers),
+                    request_round_count=len(analyzed_rounds),
+                    request_record_count=matched_lines,
+                )
+            yield make_result(line_number - 1, line_number)
+            analyzer = None
+            request_identity = None
+            selected_rank = rank_filter
+            block_search_start = line_number
+            first_record_line = None
+            last_record = None
+            last_by_layer = {}
+            analyzed_layers = set()
+            analyzed_rounds = set()
+            matched_lines = 0
+            ignored_lines = 0
+
+        if analyzer is None:
+            analyzer = analyzer_factory()
+            request_identity = identity
+            first_record_line = line_number
+            if selected_rank is None:
+                selected_rank = record.rank
+
+        assert selected_rank is not None
+        if record.rank != selected_rank:
+            if progress is not None:
+                progress.update(
+                    path,
+                    line_number,
+                    scanned_lines,
+                    matched_lines,
+                    ignored_lines,
+                    last_record,
+                    request_layer_count=len(analyzed_layers),
+                    request_round_count=len(analyzed_rounds),
+                    request_record_count=matched_lines,
+                )
+            continue
+
+        analyzer.process(record)
+        layer_key = (record.rank, record.layer_id)
+        last_by_layer[layer_key] = (record.decode_round, record.seq_len)
+        analyzed_layers.add(layer_key)
+        analyzed_rounds.add(record.decode_round)
+        matched_lines += 1
+        last_record = record
+        if progress is not None:
+            progress.update(
+                path,
+                line_number,
+                scanned_lines,
+                matched_lines,
+                ignored_lines,
+                last_record,
+                request_layer_count=len(analyzed_layers),
+                request_round_count=len(analyzed_rounds),
+                request_record_count=matched_lines,
+            )
+
+    if analyzer is not None:
+        if progress is not None:
+            progress.finish(
+                path,
+                last_seen_line,
+                scanned_lines,
+                matched_lines,
+                ignored_lines,
+                last_record,
+                request_layer_count=len(analyzed_layers),
+                request_round_count=len(analyzed_rounds),
+                request_record_count=matched_lines,
+            )
+        yield make_result(last_seen_line, last_seen_line + 1)
 
 
 def _print_stats_group(
@@ -1022,8 +1170,16 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         type=int,
         metavar="N",
         help=(
-            "analyze one contiguous request instance starting at or after "
-            "1-based line N, then print next_start_line"
+            "start request-block scanning at or after 1-based line N; without "
+            "--all-requests, analyze only the first block"
+        ),
+    )
+    parser.add_argument(
+        "--all-requests",
+        action="store_true",
+        help=(
+            "scan one log once and print a separate report for every "
+            "contiguous request block"
         ),
     )
     parser.add_argument(
@@ -1031,8 +1187,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         type=int,
         metavar="N",
         help=(
-            "analyze only rank N in --start-line mode; by default, use the "
-            "first rank found in the request block"
+            "analyze only rank N in request-block mode; by default, use the "
+            "first rank found in each block"
         ),
     )
     parser.add_argument(
@@ -1069,11 +1225,46 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if args.no_progress
             else ProgressReporter(every=args.progress_every)
         )
-        analyzer = HitRateAnalyzer(
-            topk_capacity=args.topk_capacity,
-            device_capacity=args.device_capacity,
-            probation_age=args.probation_age,
-        )
+
+        def new_analyzer() -> HitRateAnalyzer:
+            return HitRateAnalyzer(
+                topk_capacity=args.topk_capacity,
+                device_capacity=args.device_capacity,
+                probation_age=args.probation_age,
+            )
+
+        if args.all_requests:
+            if len(args.logs) != 1:
+                raise ValueError("--all-requests requires exactly one log file")
+            if args.csv:
+                raise ValueError("--csv is not supported with --all-requests")
+            request_count = 0
+            for analyzer, matched_lines, ignored_lines, block_window in (
+                analyze_all_request_blocks(
+                    args.logs[0],
+                    new_analyzer,
+                    start_line=args.start_line or 1,
+                    progress=progress,
+                    rank_filter=args.rank,
+                )
+            ):
+                if matched_lines == 0:
+                    raise ValueError(
+                        "rank {} has no top-k records in request block "
+                        "starting at line {}".format(
+                            args.rank, block_window.first_record_line
+                        )
+                    )
+                request_count += 1
+                print("\n=== Request block {} ===".format(request_count))
+                print_report(analyzer, matched_lines, ignored_lines, args.details)
+                print_request_window(block_window)
+            if request_count == 0:
+                raise ValueError("no SPARSE_KV_DECODE_TOPK request blocks found")
+            print("\nprocessed_request_blocks={}".format(request_count))
+            return 0
+
+        analyzer = new_analyzer()
         if args.start_line is not None:
             if len(args.logs) != 1:
                 raise ValueError("--start-line requires exactly one log file")
@@ -1086,7 +1277,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
         else:
             if args.rank is not None:
-                raise ValueError("--rank requires --start-line")
+                raise ValueError("--rank requires --start-line or --all-requests")
             matched_lines, ignored_lines = analyze_logs(
                 args.logs, analyzer, progress=progress
             )

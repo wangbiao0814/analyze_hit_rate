@@ -7,6 +7,7 @@ from analyze_sparse_kv_topk import (
     HitRateAnalyzer,
     POLICY_NAMES,
     ProgressReporter,
+    analyze_all_request_blocks,
     analyze_one_request,
 )
 
@@ -40,8 +41,8 @@ class AnalyzeOneRequestTest(unittest.TestCase):
             handle.write(record("req-1", 0, 2, 11, "[1, 2]"))
             handle.write(record("req-1", 1, 2, 11, "[1, 3]"))
             handle.write("request finished\n")
-            # An ordinary log line separates two contiguous top-k blocks even
-            # when the server reuses the same rid and pool slot.
+            # An ordinary log line may appear between decode groups. The
+            # reused request id is separated by the decode-round rollback.
             handle.write(record("req-1", 0, 1, 20, "[4, 5]"))
             handle.write(record("req-1", 1, 1, 20, "[4, 6]"))
             handle.write(record("req-2", 0, 1, 30, "[7, 8]", 4))
@@ -50,17 +51,17 @@ class AnalyzeOneRequestTest(unittest.TestCase):
     def analyzer() -> HitRateAnalyzer:
         return HitRateAnalyzer(topk_capacity=2, device_capacity=4)
 
-    def test_ordinary_line_ends_reused_request_id_instance(self) -> None:
+    def test_round_reset_ends_reused_request_id_instance(self) -> None:
         analyzer = self.analyzer()
         matched, ignored, window = analyze_one_request(
             self.path, analyzer, start_line=1
         )
 
         self.assertEqual(matched, 4)
-        self.assertEqual(ignored, 1)
+        self.assertEqual(ignored, 2)
         self.assertEqual(window.first_record_line, 2)
-        self.assertEqual(window.end_line, 5)
-        self.assertEqual(window.next_start_line, 6)
+        self.assertEqual(window.end_line, 6)
+        self.assertEqual(window.next_start_line, 7)
         self.assertEqual(set(analyzer.by_layer), {(0, 0), (0, 1)})
         for policy in POLICY_NAMES:
             self.assertEqual(analyzer.overall[policy].rounds, 4)
@@ -68,11 +69,11 @@ class AnalyzeOneRequestTest(unittest.TestCase):
     def test_next_cursor_analyzes_only_the_next_instance(self) -> None:
         analyzer = self.analyzer()
         matched, ignored, window = analyze_one_request(
-            self.path, analyzer, start_line=6
+            self.path, analyzer, start_line=7
         )
 
         self.assertEqual(matched, 2)
-        self.assertEqual(ignored, 1)
+        self.assertEqual(ignored, 0)
         self.assertEqual(window.first_record_line, 7)
         self.assertEqual(window.end_line, 8)
         self.assertEqual(window.next_start_line, 9)
@@ -81,6 +82,28 @@ class AnalyzeOneRequestTest(unittest.TestCase):
     def test_rejects_non_positive_start_line(self) -> None:
         with self.assertRaisesRegex(ValueError, "start-line must be >= 1"):
             analyze_one_request(self.path, self.analyzer(), start_line=0)
+
+    def test_ordinary_lines_between_decode_rounds_are_skipped(self) -> None:
+        handle = tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", delete=False
+        )
+        self.addCleanup(lambda: os.unlink(handle.name))
+        with handle:
+            handle.write(record("req-x", 0, 1, 10))
+            handle.write("scheduler output between decode rounds\n")
+            handle.write(record("req-x", 0, 2, 11, "[1, 2]"))
+            handle.write(record("req-y", 0, 1, 20, "[3, 4]", 4))
+
+        analyzer = self.analyzer()
+        matched, ignored, window = analyze_one_request(
+            handle.name, analyzer, start_line=1
+        )
+
+        self.assertEqual(matched, 2)
+        self.assertEqual(ignored, 1)
+        self.assertEqual(window.end_line, 3)
+        self.assertEqual(window.next_start_line, 4)
+        self.assertEqual(analyzer.overall[POLICY_NAMES[0]].rounds, 2)
 
     def test_contiguous_block_uses_only_first_rank_by_default(self) -> None:
         handle = tempfile.NamedTemporaryFile(
@@ -98,9 +121,9 @@ class AnalyzeOneRequestTest(unittest.TestCase):
         )
 
         self.assertEqual(matched, 1)
-        self.assertEqual(ignored, 0)
-        self.assertEqual(window.end_line, 2)
-        self.assertEqual(window.next_start_line, 3)
+        self.assertEqual(ignored, 1)
+        self.assertEqual(window.end_line, 3)
+        self.assertEqual(window.next_start_line, 4)
         self.assertEqual(window.rank, 0)
         self.assertEqual(set(analyzer.by_layer), {(0, 0)})
 
@@ -139,7 +162,29 @@ class AnalyzeOneRequestTest(unittest.TestCase):
             "topk_records=4",
             text,
         )
-        self.assertIn("line=5 scanned=5 records=4 ignored=1", text)
+        self.assertIn("line=6 scanned=6 records=4 ignored=2", text)
+
+    def test_all_request_blocks_are_processed_in_one_scan(self) -> None:
+        results = list(
+            analyze_all_request_blocks(
+                self.path,
+                self.analyzer,
+                start_line=1,
+            )
+        )
+
+        self.assertEqual([result[1] for result in results], [4, 2, 1])
+        self.assertEqual(
+            [
+                (result[3].first_record_line, result[3].end_line)
+                for result in results
+            ],
+            [(2, 6), (7, 8), (9, 9)],
+        )
+        self.assertEqual(
+            [result[3].next_start_line for result in results],
+            [7, 9, 10],
+        )
 
 
 if __name__ == "__main__":
