@@ -82,7 +82,7 @@ class AnalyzeOneRequestTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "start-line must be >= 1"):
             analyze_one_request(self.path, self.analyzer(), start_line=0)
 
-    def test_rank_and_pool_changes_do_not_split_contiguous_block(self) -> None:
+    def test_contiguous_block_uses_only_first_rank_by_default(self) -> None:
         handle = tempfile.NamedTemporaryFile(
             mode="w", encoding="utf-8", delete=False
         )
@@ -97,10 +97,23 @@ class AnalyzeOneRequestTest(unittest.TestCase):
             handle.name, analyzer, start_line=1
         )
 
-        self.assertEqual(matched, 2)
+        self.assertEqual(matched, 1)
         self.assertEqual(ignored, 0)
         self.assertEqual(window.end_line, 2)
         self.assertEqual(window.next_start_line, 3)
+        self.assertEqual(window.rank, 0)
+        self.assertEqual(set(analyzer.by_layer), {(0, 0)})
+
+        rank_one_analyzer = self.analyzer()
+        matched, _, window = analyze_one_request(
+            handle.name,
+            rank_one_analyzer,
+            start_line=1,
+            rank_filter=1,
+        )
+        self.assertEqual(matched, 1)
+        self.assertEqual(window.rank, 1)
+        self.assertEqual(set(rank_one_analyzer.by_layer), {(1, 1)})
 
     def test_progress_reports_current_record_and_final_counts(self) -> None:
         output = io.StringIO()
@@ -115,12 +128,14 @@ class AnalyzeOneRequestTest(unittest.TestCase):
 
         text = output.getvalue()
         self.assertIn(
-            "request=req-1 analyzed_layers=1 analyzed_decode_rounds=1 "
+            "request=req-1 selected_rank=0 analyzed_layers=1 "
+            "analyzed_decode_rounds=1 "
             "topk_records=1",
             text,
         )
         self.assertIn(
-            "request=req-1 analyzed_layers=2 analyzed_decode_rounds=2 "
+            "request=req-1 selected_rank=0 analyzed_layers=2 "
+            "analyzed_decode_rounds=2 "
             "topk_records=4",
             text,
         )
