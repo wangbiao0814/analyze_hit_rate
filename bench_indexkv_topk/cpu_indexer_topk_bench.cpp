@@ -1,4 +1,4 @@
-// Standalone CPU benchmark for the DeepSeek-V3.2 DSA indexer score + top-k.
+// Standalone CPU benchmark for the DeepSeek-V3.2 DSA indexer score.
 //
 // The score computed for every historical token s is:
 //   score[s] = sum_h weight[h] * relu(dot(q[h, :], index_k[s, :]))
@@ -17,13 +17,11 @@
 #include <iostream>
 #include <limits>
 #include <numeric>
+#include <pthread.h>
 #include <stdexcept>
 #include <string>
+#include <unistd.h>
 #include <vector>
-
-#ifdef _OPENMP
-#include <omp.h>
-#endif
 
 #if defined(__ARM_FEATURE_SVE_BF16)
 #include <arm_sve.h>
@@ -41,16 +39,10 @@ struct Options {
   std::int64_t seq_len = 128 * 1024;
   int heads = 64;
   int dim = 128;
-  int topk = 2048;
   int threads = 0;
   int warmup = 3;
   int iters = 10;
   bool check = false;
-};
-
-struct Entry {
-  float score;
-  std::int32_t index;
 };
 
 struct TimingStats {
@@ -68,8 +60,7 @@ struct TimingStats {
       << "  --seq-len N   historical tokens (default: 131072)\n"
       << "  --heads N     index heads (default: 64)\n"
       << "  --dim N       index head dimension (default: 128)\n"
-      << "  --topk N      selected token count (default: 2048)\n"
-      << "  --threads N   OpenMP threads (default: runtime maximum)\n"
+      << "  --threads N   pthread workers (default: online CPU count)\n"
       << "  --warmup N    warmup iterations (default: 3)\n"
       << "  --iters N     measured iterations (default: 10)\n"
       << "  --check       compare the first 256 scores with scalar code\n"
@@ -111,8 +102,6 @@ Options parse_options(int argc, char** argv) {
       options.heads = parse_integer<int>(require_value("--heads"), "heads");
     } else if (arg == "--dim") {
       options.dim = parse_integer<int>(require_value("--dim"), "dim");
-    } else if (arg == "--topk") {
-      options.topk = parse_integer<int>(require_value("--topk"), "topk");
     } else if (arg == "--threads") {
       options.threads = parse_integer<int>(require_value("--threads"), "threads");
     } else if (arg == "--warmup") {
@@ -126,12 +115,6 @@ Options parse_options(int argc, char** argv) {
     } else {
       usage(argv[0], "unknown option: " + arg);
     }
-  }
-  if (options.topk > options.seq_len) {
-    options.topk = static_cast<int>(options.seq_len);
-  }
-  if (options.seq_len > std::numeric_limits<std::int32_t>::max()) {
-    usage(argv[0], "seq-len must fit in the int32 top-k index type");
   }
   return options;
 }
@@ -356,18 +339,16 @@ const char* kernel_name() {
 #endif
 }
 
-int runtime_threads() {
-#ifdef _OPENMP
-  return omp_get_max_threads();
-#else
-  return 1;
-#endif
+int online_cpu_count() {
+  const long count = sysconf(_SC_NPROCESSORS_ONLN);
+  return count > 0 && count <= std::numeric_limits<int>::max()
+             ? static_cast<int>(count)
+             : 1;
 }
 
 void initialize_inputs(std::vector<std::uint16_t>& q,
                        std::vector<std::uint16_t>& index_k,
                        std::vector<float>& weights) {
-#pragma omp parallel for schedule(static)
   for (std::int64_t i = 0; i < static_cast<std::int64_t>(index_k.size()); ++i) {
     index_k[static_cast<std::size_t>(i)] =
         fp32_to_bf16(deterministic_float(static_cast<std::uint64_t>(i) + 1));
@@ -382,71 +363,166 @@ void initialize_inputs(std::vector<std::uint16_t>& q,
   }
 }
 
-void compute_scores(const std::vector<std::uint16_t>& q,
-                    const std::vector<std::uint16_t>& index_k,
-                    const std::vector<float>& weights,
-                    std::vector<float>& scores,
-                    int heads,
-                    int dim) {
-#pragma omp parallel for schedule(static)
-  for (std::int64_t token = 0; token < static_cast<std::int64_t>(scores.size()); ++token) {
-    const std::uint16_t* key = index_k.data() + token * dim;
-    scores[static_cast<std::size_t>(token)] =
-        weighted_relu_sum_native(q.data(), key, weights.data(), heads, dim);
-  }
-}
-
-bool better_entry(const Entry& lhs, const Entry& rhs) {
-  if (lhs.score != rhs.score) {
-    return lhs.score > rhs.score;
-  }
-  return lhs.index < rhs.index;
-}
-
-std::vector<Entry> parallel_topk(const std::vector<float>& scores, int topk) {
-  const int max_threads = runtime_threads();
-  std::vector<std::vector<Entry>> local_candidates(max_threads);
-
-#pragma omp parallel
-  {
-#ifdef _OPENMP
-    const int thread_id = omp_get_thread_num();
-    const int thread_count = omp_get_num_threads();
-#else
-    const int thread_id = 0;
-    const int thread_count = 1;
-#endif
-    const std::int64_t begin =
-        static_cast<std::int64_t>(scores.size()) * thread_id / thread_count;
-    const std::int64_t end =
-        static_cast<std::int64_t>(scores.size()) * (thread_id + 1) / thread_count;
-    auto& local = local_candidates[thread_id];
-    local.reserve(static_cast<std::size_t>(end - begin));
-    for (std::int64_t i = begin; i < end; ++i) {
-      local.push_back({scores[static_cast<std::size_t>(i)], static_cast<std::int32_t>(i)});
+class PthreadScoreExecutor {
+ public:
+  PthreadScoreExecutor(const std::vector<std::uint16_t>& q,
+                       const std::vector<std::uint16_t>& index_k,
+                       const std::vector<float>& weights,
+                       std::vector<float>& scores,
+                       int heads,
+                       int dim,
+                       int thread_count)
+      : q_(q.data()),
+        index_k_(index_k.data()),
+        weights_(weights.data()),
+        scores_(scores.data()),
+        seq_len_(scores.size()),
+        heads_(heads),
+        dim_(dim),
+        thread_count_(thread_count) {
+    if (thread_count_ <= 0) {
+      throw std::invalid_argument("pthread worker count must be positive");
     }
-    if (static_cast<int>(local.size()) > topk) {
-      std::nth_element(local.begin(), local.begin() + topk, local.end(), better_entry);
-      local.resize(topk);
+    threads_.resize(static_cast<std::size_t>(thread_count_));
+    contexts_.resize(static_cast<std::size_t>(thread_count_));
+    int error = pthread_mutex_init(&mutex_, nullptr);
+    if (error != 0) {
+      throw_pthread_error("pthread_mutex_init", error);
+    }
+    error = pthread_cond_init(&start_condition_, nullptr);
+    if (error != 0) {
+      pthread_mutex_destroy(&mutex_);
+      throw_pthread_error("pthread_cond_init(start)", error);
+    }
+    error = pthread_cond_init(&done_condition_, nullptr);
+    if (error != 0) {
+      pthread_cond_destroy(&start_condition_);
+      pthread_mutex_destroy(&mutex_);
+      throw_pthread_error("pthread_cond_init(done)", error);
+    }
+
+    int created = 0;
+    for (; created < thread_count_; ++created) {
+      contexts_[static_cast<std::size_t>(created)] = {this, created};
+      error = pthread_create(&threads_[static_cast<std::size_t>(created)],
+                             nullptr,
+                             &PthreadScoreExecutor::worker_entry,
+                             &contexts_[static_cast<std::size_t>(created)]);
+      if (error != 0) {
+        stop_and_join(created);
+        pthread_cond_destroy(&done_condition_);
+        pthread_cond_destroy(&start_condition_);
+        pthread_mutex_destroy(&mutex_);
+        throw_pthread_error("pthread_create", error);
+      }
     }
   }
 
-  std::size_t candidate_count = 0;
-  for (const auto& local : local_candidates) {
-    candidate_count += local.size();
+  PthreadScoreExecutor(const PthreadScoreExecutor&) = delete;
+  PthreadScoreExecutor& operator=(const PthreadScoreExecutor&) = delete;
+
+  ~PthreadScoreExecutor() {
+    stop_and_join(thread_count_);
+    pthread_cond_destroy(&done_condition_);
+    pthread_cond_destroy(&start_condition_);
+    pthread_mutex_destroy(&mutex_);
   }
-  std::vector<Entry> result;
-  result.reserve(candidate_count);
-  for (auto& local : local_candidates) {
-    result.insert(result.end(), local.begin(), local.end());
+
+  void compute_scores() {
+    pthread_mutex_lock(&mutex_);
+    completed_workers_ = 0;
+    ++generation_;
+    pthread_cond_broadcast(&start_condition_);
+    while (completed_workers_ != thread_count_) {
+      pthread_cond_wait(&done_condition_, &mutex_);
+    }
+    pthread_mutex_unlock(&mutex_);
   }
-  if (static_cast<int>(result.size()) > topk) {
-    std::nth_element(result.begin(), result.begin() + topk, result.end(), better_entry);
-    result.resize(topk);
+
+  int thread_count() const { return thread_count_; }
+
+ private:
+  struct WorkerContext {
+    PthreadScoreExecutor* executor = nullptr;
+    int thread_id = 0;
+  };
+
+  [[noreturn]] static void throw_pthread_error(const char* operation, int error) {
+    throw std::runtime_error(std::string(operation) + ": " + std::strerror(error));
   }
-  std::sort(result.begin(), result.end(), better_entry);
-  return result;
-}
+
+  static void* worker_entry(void* argument) {
+    auto* context = static_cast<WorkerContext*>(argument);
+    context->executor->worker_loop(context->thread_id);
+    return nullptr;
+  }
+
+  std::size_t token_boundary(int boundary) const {
+    // Equivalent to floor(seq_len * boundary / thread_count), without making
+    // the multiplication overflow for very large sequence lengths.
+    const std::size_t quotient = seq_len_ / static_cast<std::size_t>(thread_count_);
+    const std::size_t remainder = seq_len_ % static_cast<std::size_t>(thread_count_);
+    const std::size_t position = static_cast<std::size_t>(boundary);
+    return quotient * position + remainder * position / thread_count_;
+  }
+
+  void worker_loop(int thread_id) {
+    std::uint64_t observed_generation = 0;
+    pthread_mutex_lock(&mutex_);
+    while (true) {
+      while (!stop_ && observed_generation == generation_) {
+        pthread_cond_wait(&start_condition_, &mutex_);
+      }
+      if (stop_) {
+        pthread_mutex_unlock(&mutex_);
+        return;
+      }
+      observed_generation = generation_;
+      pthread_mutex_unlock(&mutex_);
+
+      const std::size_t begin = token_boundary(thread_id);
+      const std::size_t end = token_boundary(thread_id + 1);
+      for (std::size_t token = begin; token < end; ++token) {
+        const std::uint16_t* key = index_k_ + token * dim_;
+        scores_[token] =
+            weighted_relu_sum_native(q_, key, weights_, heads_, dim_);
+      }
+
+      pthread_mutex_lock(&mutex_);
+      ++completed_workers_;
+      if (completed_workers_ == thread_count_) {
+        pthread_cond_signal(&done_condition_);
+      }
+    }
+  }
+
+  void stop_and_join(int created_threads) {
+    pthread_mutex_lock(&mutex_);
+    stop_ = true;
+    pthread_cond_broadcast(&start_condition_);
+    pthread_mutex_unlock(&mutex_);
+    for (int i = 0; i < created_threads; ++i) {
+      pthread_join(threads_[static_cast<std::size_t>(i)], nullptr);
+    }
+  }
+
+  const std::uint16_t* q_;
+  const std::uint16_t* index_k_;
+  const float* weights_;
+  float* scores_;
+  std::size_t seq_len_;
+  int heads_;
+  int dim_;
+  int thread_count_;
+  std::vector<pthread_t> threads_;
+  std::vector<WorkerContext> contexts_;
+  pthread_mutex_t mutex_{};
+  pthread_cond_t start_condition_{};
+  pthread_cond_t done_condition_{};
+  std::uint64_t generation_ = 0;
+  int completed_workers_ = 0;
+  bool stop_ = false;
+};
 
 TimingStats summarize(std::vector<double> samples) {
   if (samples.empty()) {
@@ -496,42 +572,13 @@ void check_scores(const std::vector<std::uint16_t>& q,
   }
 }
 
-void check_topk(const std::vector<float>& scores,
-                const std::vector<Entry>& actual,
-                int topk) {
-  std::vector<Entry> expected;
-  expected.reserve(scores.size());
-  for (std::size_t i = 0; i < scores.size(); ++i) {
-    expected.push_back({scores[i], static_cast<std::int32_t>(i)});
-  }
-  std::partial_sort(expected.begin(), expected.begin() + topk, expected.end(), better_entry);
-  expected.resize(topk);
-  if (actual.size() != expected.size()) {
-    throw std::runtime_error("parallel top-k returned the wrong number of entries");
-  }
-  for (std::size_t i = 0; i < expected.size(); ++i) {
-    if (actual[i].index != expected[i].index || actual[i].score != expected[i].score) {
-      throw std::runtime_error("parallel top-k differs from serial partial_sort");
-    }
-  }
-  std::cout << "topk_check=pass\n";
-}
-
 }  // namespace
 
 int main(int argc, char** argv) {
   try {
     const Options options = parse_options(argc, argv);
-#ifdef _OPENMP
-    omp_set_dynamic(0);
-    if (options.threads > 0) {
-      omp_set_num_threads(options.threads);
-    }
-#else
-    if (options.threads > 1) {
-      std::cerr << "warning: binary was built without OpenMP; using one thread\n";
-    }
-#endif
+    const int thread_count =
+        options.threads > 0 ? options.threads : online_cpu_count();
 
     const std::size_t q_elements =
         static_cast<std::size_t>(options.heads) * options.dim;
@@ -543,52 +590,39 @@ int main(int argc, char** argv) {
     std::vector<float> scores(static_cast<std::size_t>(options.seq_len));
 
     initialize_inputs(q, index_k, weights);
+    PthreadScoreExecutor score_executor(
+        q, index_k, weights, scores, options.heads, options.dim, thread_count);
 
     std::cout << "kernel=" << kernel_name() << "\n";
-    std::cout << "threads=" << runtime_threads();
+    std::cout << "threads=" << score_executor.thread_count();
 #if defined(__ARM_FEATURE_SVE_BF16)
     std::cout << " sve_bits=" << svcntb() * 8;
 #endif
     std::cout << "\n";
     std::cout << "shape: q=[" << options.heads << ',' << options.dim
-              << "] index_k=[" << options.seq_len << ',' << options.dim
-              << "] topk=" << options.topk << "\n";
+              << "] index_k=[" << options.seq_len << ',' << options.dim << "]\n";
     std::cout << "index_k_size_mib=" << std::fixed << std::setprecision(2)
               << (index_k.size() * sizeof(std::uint16_t) / 1048576.0) << "\n";
 
-    std::vector<Entry> topk_result;
     for (int i = 0; i < options.warmup; ++i) {
-      compute_scores(q, index_k, weights, scores, options.heads, options.dim);
-      topk_result = parallel_topk(scores, options.topk);
+      score_executor.compute_scores();
     }
 
     std::vector<double> score_samples;
-    std::vector<double> topk_samples;
-    std::vector<double> total_samples;
     score_samples.reserve(options.iters);
-    topk_samples.reserve(options.iters);
-    total_samples.reserve(options.iters);
 
     for (int i = 0; i < options.iters; ++i) {
-      const auto total_begin = Clock::now();
-      const auto score_begin = total_begin;
-      compute_scores(q, index_k, weights, scores, options.heads, options.dim);
+      const auto score_begin = Clock::now();
+      score_executor.compute_scores();
       const auto score_end = Clock::now();
-      topk_result = parallel_topk(scores, options.topk);
-      const auto topk_end = Clock::now();
       score_samples.push_back(elapsed_ms(score_begin, score_end));
-      topk_samples.push_back(elapsed_ms(score_end, topk_end));
-      total_samples.push_back(elapsed_ms(total_begin, topk_end));
     }
 
     if (options.check) {
       check_scores(q, index_k, weights, scores, options.heads, options.dim);
-      check_topk(scores, topk_result, options.topk);
     }
 
     const TimingStats score_stats = summarize(score_samples);
-    const TimingStats topk_stats = summarize(topk_samples);
-    const TimingStats total_stats = summarize(total_samples);
     const double flops = 2.0 * options.seq_len * options.heads * options.dim;
     const double effective_gflops = flops / (score_stats.median_ms * 1.0e6);
     const double unique_k_gib = index_k.size() * sizeof(std::uint16_t) /
@@ -600,18 +634,12 @@ int main(int argc, char** argv) {
                 << " mean=" << stats.mean_ms << "\n";
     };
     print_stats("score", score_stats);
-    print_stats("topk", topk_stats);
-    print_stats("total", total_stats);
     std::cout << "score_effective_gflops=" << effective_gflops << "\n";
     std::cout << "unique_index_k_gib_per_s=" << unique_k_gib_per_s << "\n";
 
-    double checksum = 0.0;
-    std::cout << "top_indices:";
-    for (std::size_t i = 0; i < std::min<std::size_t>(10, topk_result.size()); ++i) {
-      std::cout << ' ' << topk_result[i].index;
-      checksum += static_cast<double>(topk_result[i].score) * (i + 1);
-    }
-    std::cout << "\nchecksum=" << checksum << "\n";
+    const double checksum =
+        std::accumulate(scores.begin(), scores.end(), 0.0);
+    std::cout << "checksum=" << checksum << "\n";
     return 0;
   } catch (const std::exception& error) {
     std::cerr << "fatal: " << error.what() << "\n";
