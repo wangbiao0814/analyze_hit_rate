@@ -152,9 +152,38 @@ float dot_bf16_scalar(const std::uint16_t* lhs, const std::uint16_t* rhs, int di
 
 #if defined(__ARM_FEATURE_SVE_BF16)
 float dot_bf16_native(const std::uint16_t* lhs, const std::uint16_t* rhs, int dim) {
-  svfloat32_t accum = svdup_n_f32(0.0f);
+  svfloat32_t accum0 = svdup_n_f32(0.0f);
+  svfloat32_t accum1 = svdup_n_f32(0.0f);
+  svfloat32_t accum2 = svdup_n_f32(0.0f);
+  svfloat32_t accum3 = svdup_n_f32(0.0f);
   const std::uint64_t lanes = svcnth();
-  for (std::uint64_t d = 0; d < static_cast<std::uint64_t>(dim); d += lanes) {
+  const std::uint64_t elements = static_cast<std::uint64_t>(dim);
+  std::uint64_t d = 0;
+  for (; d + 4 * lanes <= elements; d += 4 * lanes) {
+    const svbool_t predicate = svptrue_b16();
+    accum0 = svbfdot_f32(
+        accum0,
+        svld1_bf16(predicate, reinterpret_cast<const bfloat16_t*>(lhs + d)),
+        svld1_bf16(predicate, reinterpret_cast<const bfloat16_t*>(rhs + d)));
+    accum1 = svbfdot_f32(
+        accum1,
+        svld1_bf16(predicate, reinterpret_cast<const bfloat16_t*>(lhs + d + lanes)),
+        svld1_bf16(predicate, reinterpret_cast<const bfloat16_t*>(rhs + d + lanes)));
+    accum2 = svbfdot_f32(
+        accum2,
+        svld1_bf16(predicate, reinterpret_cast<const bfloat16_t*>(lhs + d + 2 * lanes)),
+        svld1_bf16(predicate, reinterpret_cast<const bfloat16_t*>(rhs + d + 2 * lanes)));
+    accum3 = svbfdot_f32(
+        accum3,
+        svld1_bf16(predicate, reinterpret_cast<const bfloat16_t*>(lhs + d + 3 * lanes)),
+        svld1_bf16(predicate, reinterpret_cast<const bfloat16_t*>(rhs + d + 3 * lanes)));
+  }
+
+  svfloat32_t accum = svadd_f32_x(
+      svptrue_b32(),
+      svadd_f32_x(svptrue_b32(), accum0, accum1),
+      svadd_f32_x(svptrue_b32(), accum2, accum3));
+  for (; d < elements; d += lanes) {
     const svbool_t predicate = svwhilelt_b16(d, static_cast<std::uint64_t>(dim));
     const svbfloat16_t lhs_vec = svld1_bf16(
         predicate, reinterpret_cast<const bfloat16_t*>(lhs + d));
@@ -166,8 +195,20 @@ float dot_bf16_native(const std::uint16_t* lhs, const std::uint16_t* rhs, int di
 }
 #elif defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC)
 float dot_bf16_native(const std::uint16_t* lhs, const std::uint16_t* rhs, int dim) {
-  float32x4_t accum = vdupq_n_f32(0.0f);
+  float32x4_t accum0 = vdupq_n_f32(0.0f);
+  float32x4_t accum1 = vdupq_n_f32(0.0f);
   int d = 0;
+  for (; d + 16 <= dim; d += 16) {
+    accum0 = vbfdotq_f32(
+        accum0,
+        vld1q_bf16(reinterpret_cast<const bfloat16_t*>(lhs + d)),
+        vld1q_bf16(reinterpret_cast<const bfloat16_t*>(rhs + d)));
+    accum1 = vbfdotq_f32(
+        accum1,
+        vld1q_bf16(reinterpret_cast<const bfloat16_t*>(lhs + d + 8)),
+        vld1q_bf16(reinterpret_cast<const bfloat16_t*>(rhs + d + 8)));
+  }
+  float32x4_t accum = vaddq_f32(accum0, accum1);
   for (; d + 8 <= dim; d += 8) {
     const bfloat16x8_t lhs_vec =
         vld1q_bf16(reinterpret_cast<const bfloat16_t*>(lhs + d));
@@ -225,7 +266,54 @@ float32x4_t dot_bf16_4heads_native(const std::uint16_t* q,
   float32x4_t accum1 = vdupq_n_f32(0.0f);
   float32x4_t accum2 = vdupq_n_f32(0.0f);
   float32x4_t accum3 = vdupq_n_f32(0.0f);
+  float32x4_t accum4 = vdupq_n_f32(0.0f);
+  float32x4_t accum5 = vdupq_n_f32(0.0f);
+  float32x4_t accum6 = vdupq_n_f32(0.0f);
+  float32x4_t accum7 = vdupq_n_f32(0.0f);
   int d = 0;
+  for (; d + 16 <= dim; d += 16) {
+    const bfloat16x8_t key_vec0 =
+        vld1q_bf16(reinterpret_cast<const bfloat16_t*>(key + d));
+    const bfloat16x8_t key_vec1 =
+        vld1q_bf16(reinterpret_cast<const bfloat16_t*>(key + d + 8));
+    accum0 = vbfdotq_f32(
+        accum0,
+        vld1q_bf16(reinterpret_cast<const bfloat16_t*>(q + d)),
+        key_vec0);
+    accum1 = vbfdotq_f32(
+        accum1,
+        vld1q_bf16(reinterpret_cast<const bfloat16_t*>(q + dim + d)),
+        key_vec0);
+    accum2 = vbfdotq_f32(
+        accum2,
+        vld1q_bf16(reinterpret_cast<const bfloat16_t*>(q + 2 * dim + d)),
+        key_vec0);
+    accum3 = vbfdotq_f32(
+        accum3,
+        vld1q_bf16(reinterpret_cast<const bfloat16_t*>(q + 3 * dim + d)),
+        key_vec0);
+    accum4 = vbfdotq_f32(
+        accum4,
+        vld1q_bf16(reinterpret_cast<const bfloat16_t*>(q + d + 8)),
+        key_vec1);
+    accum5 = vbfdotq_f32(
+        accum5,
+        vld1q_bf16(reinterpret_cast<const bfloat16_t*>(q + dim + d + 8)),
+        key_vec1);
+    accum6 = vbfdotq_f32(
+        accum6,
+        vld1q_bf16(reinterpret_cast<const bfloat16_t*>(q + 2 * dim + d + 8)),
+        key_vec1);
+    accum7 = vbfdotq_f32(
+        accum7,
+        vld1q_bf16(reinterpret_cast<const bfloat16_t*>(q + 3 * dim + d + 8)),
+        key_vec1);
+  }
+
+  accum0 = vaddq_f32(accum0, accum4);
+  accum1 = vaddq_f32(accum1, accum5);
+  accum2 = vaddq_f32(accum2, accum6);
+  accum3 = vaddq_f32(accum3, accum7);
   for (; d + 8 <= dim; d += 8) {
     const bfloat16x8_t key_vec =
         vld1q_bf16(reinterpret_cast<const bfloat16_t*>(key + d));
