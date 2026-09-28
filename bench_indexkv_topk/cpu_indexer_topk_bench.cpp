@@ -27,7 +27,9 @@
 
 #if defined(__ARM_FEATURE_SVE_BF16)
 #include <arm_sve.h>
-#elif defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC)
+#endif
+
+#if defined(__aarch64__)
 #include <arm_neon.h>
 #endif
 
@@ -208,6 +210,142 @@ float dot_bf16_native(const std::uint16_t* lhs, const std::uint16_t* rhs, int di
 }
 #endif
 
+#if defined(__ARM_FEATURE_SVE_BF16)
+float weighted_relu_sum_native(const std::uint16_t* q,
+                               const std::uint16_t* key,
+                               const float* weights,
+                               int heads,
+                               int dim) {
+  // SVE implementations can expose at most 2048 bits, or 64 FP32 lanes.
+  alignas(256) float dots[64];
+  const std::uint64_t lanes = svcntw();
+  svfloat32_t score = svdup_n_f32(0.0f);
+
+  for (std::uint64_t head = 0; head < static_cast<std::uint64_t>(heads); head += lanes) {
+    const std::uint64_t active =
+        std::min(lanes, static_cast<std::uint64_t>(heads) - head);
+    for (std::uint64_t lane = 0; lane < active; ++lane) {
+      dots[lane] = dot_bf16_native(q + (head + lane) * dim, key, dim);
+    }
+
+    const svbool_t predicate = svwhilelt_b32(std::uint64_t{0}, active);
+    const svfloat32_t dot_vec = svld1_f32(predicate, dots);
+    const svfloat32_t weight_vec = svld1_f32(predicate, weights + head);
+    const svfloat32_t relu_vec =
+        svmax_f32_x(predicate, dot_vec, svdup_n_f32(0.0f));
+    score = svmla_f32_m(predicate, score, weight_vec, relu_vec);
+  }
+
+  return svaddv_f32(svptrue_b32(), score);
+}
+#elif defined(__aarch64__)
+
+#if defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC)
+float32x4_t dot_bf16_4heads_native(const std::uint16_t* q,
+                                   const std::uint16_t* key,
+                                   int dim) {
+  float32x4_t accum0 = vdupq_n_f32(0.0f);
+  float32x4_t accum1 = vdupq_n_f32(0.0f);
+  float32x4_t accum2 = vdupq_n_f32(0.0f);
+  float32x4_t accum3 = vdupq_n_f32(0.0f);
+  int d = 0;
+  for (; d + 8 <= dim; d += 8) {
+    const bfloat16x8_t key_vec =
+        vld1q_bf16(reinterpret_cast<const bfloat16_t*>(key + d));
+    accum0 = vbfdotq_f32(
+        accum0,
+        vld1q_bf16(reinterpret_cast<const bfloat16_t*>(q + d)),
+        key_vec);
+    accum1 = vbfdotq_f32(
+        accum1,
+        vld1q_bf16(reinterpret_cast<const bfloat16_t*>(q + dim + d)),
+        key_vec);
+    accum2 = vbfdotq_f32(
+        accum2,
+        vld1q_bf16(reinterpret_cast<const bfloat16_t*>(q + 2 * dim + d)),
+        key_vec);
+    accum3 = vbfdotq_f32(
+        accum3,
+        vld1q_bf16(reinterpret_cast<const bfloat16_t*>(q + 3 * dim + d)),
+        key_vec);
+  }
+
+  // Pairwise reductions leave one dot product in each FP32 lane.
+  const float32x4_t pair01 = vpaddq_f32(accum0, accum1);
+  const float32x4_t pair23 = vpaddq_f32(accum2, accum3);
+  float32x4_t dots = vpaddq_f32(pair01, pair23);
+  if (d < dim) {
+    alignas(16) float dot_lanes[4];
+    vst1q_f32(dot_lanes, dots);
+    for (; d < dim; ++d) {
+      const float key_value = bf16_to_fp32(key[d]);
+      dot_lanes[0] += bf16_to_fp32(q[d]) * key_value;
+      dot_lanes[1] += bf16_to_fp32(q[dim + d]) * key_value;
+      dot_lanes[2] += bf16_to_fp32(q[2 * dim + d]) * key_value;
+      dot_lanes[3] += bf16_to_fp32(q[3 * dim + d]) * key_value;
+    }
+    dots = vld1q_f32(dot_lanes);
+  }
+  return dots;
+}
+#endif
+
+float weighted_relu_sum_native(const std::uint16_t* q,
+                               const std::uint16_t* key,
+                               const float* weights,
+                               int heads,
+                               int dim) {
+  const float32x4_t zero = vdupq_n_f32(0.0f);
+  float32x4_t score = zero;
+  int head = 0;
+  for (; head + 4 <= heads; head += 4) {
+#if defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC)
+    const float32x4_t dot_vec =
+        dot_bf16_4heads_native(q + static_cast<std::int64_t>(head) * dim, key, dim);
+#else
+    alignas(16) float dot_lanes[4];
+    for (int lane = 0; lane < 4; ++lane) {
+      dot_lanes[lane] = dot_bf16_native(
+          q + static_cast<std::int64_t>(head + lane) * dim, key, dim);
+    }
+    const float32x4_t dot_vec = vld1q_f32(dot_lanes);
+#endif
+    score = vfmaq_f32(score,
+                      vld1q_f32(weights + head),
+                      vmaxq_f32(dot_vec, zero));
+  }
+
+  if (head < heads) {
+    alignas(16) float dot_lanes[4] = {};
+    alignas(16) float weight_lanes[4] = {};
+    for (int lane = 0; head + lane < heads; ++lane) {
+      dot_lanes[lane] = dot_bf16_native(
+          q + static_cast<std::int64_t>(head + lane) * dim, key, dim);
+      weight_lanes[lane] = weights[head + lane];
+    }
+    score = vfmaq_f32(score,
+                      vld1q_f32(weight_lanes),
+                      vmaxq_f32(vld1q_f32(dot_lanes), zero));
+  }
+
+  return vaddvq_f32(score);
+}
+#else
+float weighted_relu_sum_native(const std::uint16_t* q,
+                               const std::uint16_t* key,
+                               const float* weights,
+                               int heads,
+                               int dim) {
+  float score = 0.0f;
+  for (int head = 0; head < heads; ++head) {
+    const float dot =
+        dot_bf16_native(q + static_cast<std::int64_t>(head) * dim, key, dim);
+    score += weights[head] * std::max(dot, 0.0f);
+  }
+  return score;
+}
+#endif
+
 const char* kernel_name() {
 #if defined(__ARM_FEATURE_SVE_BF16)
   return "Arm SVE BF16 BFDOT";
@@ -253,13 +391,8 @@ void compute_scores(const std::vector<std::uint16_t>& q,
 #pragma omp parallel for schedule(static)
   for (std::int64_t token = 0; token < static_cast<std::int64_t>(scores.size()); ++token) {
     const std::uint16_t* key = index_k.data() + token * dim;
-    float score = 0.0f;
-    for (int head = 0; head < heads; ++head) {
-      const std::uint16_t* query = q.data() + static_cast<std::int64_t>(head) * dim;
-      const float dot = dot_bf16_native(query, key, dim);
-      score += weights[head] * std::max(dot, 0.0f);
-    }
-    scores[static_cast<std::size_t>(token)] = score;
+    scores[static_cast<std::size_t>(token)] =
+        weighted_relu_sum_native(q.data(), key, weights.data(), heads, dim);
   }
 }
 
