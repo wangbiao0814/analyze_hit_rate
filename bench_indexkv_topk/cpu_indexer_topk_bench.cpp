@@ -17,10 +17,8 @@
 #include <iostream>
 #include <limits>
 #include <numeric>
-#include <pthread.h>
 #include <stdexcept>
 #include <string>
-#include <unistd.h>
 #include <vector>
 
 #if defined(__ARM_FEATURE_SVE_BF16)
@@ -39,7 +37,6 @@ struct Options {
   std::int64_t seq_len = 128 * 1024;
   int heads = 64;
   int dim = 128;
-  int threads = 0;
   int warmup = 3;
   int iters = 10;
   bool check = false;
@@ -60,7 +57,6 @@ struct TimingStats {
       << "  --seq-len N   historical tokens (default: 131072)\n"
       << "  --heads N     index heads (default: 64)\n"
       << "  --dim N       index head dimension (default: 128)\n"
-      << "  --threads N   pthread workers (default: online CPU count)\n"
       << "  --warmup N    warmup iterations (default: 3)\n"
       << "  --iters N     measured iterations (default: 10)\n"
       << "  --check       compare the first 256 scores with scalar code\n"
@@ -102,8 +98,6 @@ Options parse_options(int argc, char** argv) {
       options.heads = parse_integer<int>(require_value("--heads"), "heads");
     } else if (arg == "--dim") {
       options.dim = parse_integer<int>(require_value("--dim"), "dim");
-    } else if (arg == "--threads") {
-      options.threads = parse_integer<int>(require_value("--threads"), "threads");
     } else if (arg == "--warmup") {
       options.warmup = parse_integer<int>(require_value("--warmup"), "warmup");
     } else if (arg == "--iters") {
@@ -339,13 +333,6 @@ const char* kernel_name() {
 #endif
 }
 
-int online_cpu_count() {
-  const long count = sysconf(_SC_NPROCESSORS_ONLN);
-  return count > 0 && count <= std::numeric_limits<int>::max()
-             ? static_cast<int>(count)
-             : 1;
-}
-
 void initialize_inputs(std::vector<std::uint16_t>& q,
                        std::vector<std::uint16_t>& index_k,
                        std::vector<float>& weights) {
@@ -363,166 +350,18 @@ void initialize_inputs(std::vector<std::uint16_t>& q,
   }
 }
 
-class PthreadScoreExecutor {
- public:
-  PthreadScoreExecutor(const std::vector<std::uint16_t>& q,
-                       const std::vector<std::uint16_t>& index_k,
-                       const std::vector<float>& weights,
-                       std::vector<float>& scores,
-                       int heads,
-                       int dim,
-                       int thread_count)
-      : q_(q.data()),
-        index_k_(index_k.data()),
-        weights_(weights.data()),
-        scores_(scores.data()),
-        seq_len_(scores.size()),
-        heads_(heads),
-        dim_(dim),
-        thread_count_(thread_count) {
-    if (thread_count_ <= 0) {
-      throw std::invalid_argument("pthread worker count must be positive");
-    }
-    threads_.resize(static_cast<std::size_t>(thread_count_));
-    contexts_.resize(static_cast<std::size_t>(thread_count_));
-    int error = pthread_mutex_init(&mutex_, nullptr);
-    if (error != 0) {
-      throw_pthread_error("pthread_mutex_init", error);
-    }
-    error = pthread_cond_init(&start_condition_, nullptr);
-    if (error != 0) {
-      pthread_mutex_destroy(&mutex_);
-      throw_pthread_error("pthread_cond_init(start)", error);
-    }
-    error = pthread_cond_init(&done_condition_, nullptr);
-    if (error != 0) {
-      pthread_cond_destroy(&start_condition_);
-      pthread_mutex_destroy(&mutex_);
-      throw_pthread_error("pthread_cond_init(done)", error);
-    }
-
-    int created = 0;
-    for (; created < thread_count_; ++created) {
-      contexts_[static_cast<std::size_t>(created)] = {this, created};
-      error = pthread_create(&threads_[static_cast<std::size_t>(created)],
-                             nullptr,
-                             &PthreadScoreExecutor::worker_entry,
-                             &contexts_[static_cast<std::size_t>(created)]);
-      if (error != 0) {
-        stop_and_join(created);
-        pthread_cond_destroy(&done_condition_);
-        pthread_cond_destroy(&start_condition_);
-        pthread_mutex_destroy(&mutex_);
-        throw_pthread_error("pthread_create", error);
-      }
-    }
+void compute_scores(const std::vector<std::uint16_t>& q,
+                    const std::vector<std::uint16_t>& index_k,
+                    const std::vector<float>& weights,
+                    std::vector<float>& scores,
+                    int heads,
+                    int dim) {
+  for (std::size_t token = 0; token < scores.size(); ++token) {
+    const std::uint16_t* key = index_k.data() + token * dim;
+    scores[token] =
+        weighted_relu_sum_native(q.data(), key, weights.data(), heads, dim);
   }
-
-  PthreadScoreExecutor(const PthreadScoreExecutor&) = delete;
-  PthreadScoreExecutor& operator=(const PthreadScoreExecutor&) = delete;
-
-  ~PthreadScoreExecutor() {
-    stop_and_join(thread_count_);
-    pthread_cond_destroy(&done_condition_);
-    pthread_cond_destroy(&start_condition_);
-    pthread_mutex_destroy(&mutex_);
-  }
-
-  void compute_scores() {
-    pthread_mutex_lock(&mutex_);
-    completed_workers_ = 0;
-    ++generation_;
-    pthread_cond_broadcast(&start_condition_);
-    while (completed_workers_ != thread_count_) {
-      pthread_cond_wait(&done_condition_, &mutex_);
-    }
-    pthread_mutex_unlock(&mutex_);
-  }
-
-  int thread_count() const { return thread_count_; }
-
- private:
-  struct WorkerContext {
-    PthreadScoreExecutor* executor = nullptr;
-    int thread_id = 0;
-  };
-
-  [[noreturn]] static void throw_pthread_error(const char* operation, int error) {
-    throw std::runtime_error(std::string(operation) + ": " + std::strerror(error));
-  }
-
-  static void* worker_entry(void* argument) {
-    auto* context = static_cast<WorkerContext*>(argument);
-    context->executor->worker_loop(context->thread_id);
-    return nullptr;
-  }
-
-  std::size_t token_boundary(int boundary) const {
-    // Equivalent to floor(seq_len * boundary / thread_count), without making
-    // the multiplication overflow for very large sequence lengths.
-    const std::size_t quotient = seq_len_ / static_cast<std::size_t>(thread_count_);
-    const std::size_t remainder = seq_len_ % static_cast<std::size_t>(thread_count_);
-    const std::size_t position = static_cast<std::size_t>(boundary);
-    return quotient * position + remainder * position / thread_count_;
-  }
-
-  void worker_loop(int thread_id) {
-    std::uint64_t observed_generation = 0;
-    pthread_mutex_lock(&mutex_);
-    while (true) {
-      while (!stop_ && observed_generation == generation_) {
-        pthread_cond_wait(&start_condition_, &mutex_);
-      }
-      if (stop_) {
-        pthread_mutex_unlock(&mutex_);
-        return;
-      }
-      observed_generation = generation_;
-      pthread_mutex_unlock(&mutex_);
-
-      const std::size_t begin = token_boundary(thread_id);
-      const std::size_t end = token_boundary(thread_id + 1);
-      for (std::size_t token = begin; token < end; ++token) {
-        const std::uint16_t* key = index_k_ + token * dim_;
-        scores_[token] =
-            weighted_relu_sum_native(q_, key, weights_, heads_, dim_);
-      }
-
-      pthread_mutex_lock(&mutex_);
-      ++completed_workers_;
-      if (completed_workers_ == thread_count_) {
-        pthread_cond_signal(&done_condition_);
-      }
-    }
-  }
-
-  void stop_and_join(int created_threads) {
-    pthread_mutex_lock(&mutex_);
-    stop_ = true;
-    pthread_cond_broadcast(&start_condition_);
-    pthread_mutex_unlock(&mutex_);
-    for (int i = 0; i < created_threads; ++i) {
-      pthread_join(threads_[static_cast<std::size_t>(i)], nullptr);
-    }
-  }
-
-  const std::uint16_t* q_;
-  const std::uint16_t* index_k_;
-  const float* weights_;
-  float* scores_;
-  std::size_t seq_len_;
-  int heads_;
-  int dim_;
-  int thread_count_;
-  std::vector<pthread_t> threads_;
-  std::vector<WorkerContext> contexts_;
-  pthread_mutex_t mutex_{};
-  pthread_cond_t start_condition_{};
-  pthread_cond_t done_condition_{};
-  std::uint64_t generation_ = 0;
-  int completed_workers_ = 0;
-  bool stop_ = false;
-};
+}
 
 TimingStats summarize(std::vector<double> samples) {
   if (samples.empty()) {
@@ -577,8 +416,6 @@ void check_scores(const std::vector<std::uint16_t>& q,
 int main(int argc, char** argv) {
   try {
     const Options options = parse_options(argc, argv);
-    const int thread_count =
-        options.threads > 0 ? options.threads : online_cpu_count();
 
     const std::size_t q_elements =
         static_cast<std::size_t>(options.heads) * options.dim;
@@ -590,22 +427,18 @@ int main(int argc, char** argv) {
     std::vector<float> scores(static_cast<std::size_t>(options.seq_len));
 
     initialize_inputs(q, index_k, weights);
-    PthreadScoreExecutor score_executor(
-        q, index_k, weights, scores, options.heads, options.dim, thread_count);
 
     std::cout << "kernel=" << kernel_name() << "\n";
-    std::cout << "threads=" << score_executor.thread_count();
 #if defined(__ARM_FEATURE_SVE_BF16)
-    std::cout << " sve_bits=" << svcntb() * 8;
+    std::cout << "sve_bits=" << svcntb() * 8 << "\n";
 #endif
-    std::cout << "\n";
     std::cout << "shape: q=[" << options.heads << ',' << options.dim
               << "] index_k=[" << options.seq_len << ',' << options.dim << "]\n";
     std::cout << "index_k_size_mib=" << std::fixed << std::setprecision(2)
               << (index_k.size() * sizeof(std::uint16_t) / 1048576.0) << "\n";
 
     for (int i = 0; i < options.warmup; ++i) {
-      score_executor.compute_scores();
+      compute_scores(q, index_k, weights, scores, options.heads, options.dim);
     }
 
     std::vector<double> score_samples;
@@ -613,7 +446,7 @@ int main(int argc, char** argv) {
 
     for (int i = 0; i < options.iters; ++i) {
       const auto score_begin = Clock::now();
-      score_executor.compute_scores();
+      compute_scores(q, index_k, weights, scores, options.heads, options.dim);
       const auto score_end = Clock::now();
       score_samples.push_back(elapsed_ms(score_begin, score_end));
     }
