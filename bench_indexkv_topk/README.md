@@ -157,3 +157,65 @@ To judge whether the lightning indexer is memory-bound, compare this benchmark's
 below the streaming ceiling while CPU execution units are busy, it is not
 limited by unique index-K DRAM bandwidth. A 128K × 128 BF16 index-K is only
 32 MiB, so also compare a cold run (`--warmup 0 --iters 1`) with warmed runs.
+
+### CPU / DRAM 硬件查询
+
+在 Kunpeng 服务器上执行以下只读命令，保留输出，用于核对 CPU 内存通道规格、
+DIMM 插法和 NUMA 拓扑，估算每个 NUMA 节点、每颗 CPU 及整机的理论内存带宽。
+
+#### CPU 型号、核数和 NUMA 拓扑
+
+```bash
+LC_ALL=C lscpu
+LC_ALL=C lscpu -e=CPU,NODE,SOCKET,CORE,ONLINE
+numactl --hardware
+```
+
+#### CPU 完整型号和服务器型号
+
+```bash
+sudo dmidecode -t processor | grep -E \
+'Socket Designation:|Manufacturer:|Version:|Current Speed:|Max Speed:|Core Count:|Thread Count:'
+
+sudo dmidecode -s system-manufacturer
+sudo dmidecode -s system-product-name
+```
+
+#### 内存槽位、容量和配置速率
+
+```bash
+sudo dmidecode -t 17 | grep -E \
+'Memory Device$|Size:|Locator:|Type:|Speed:|Data Width:|Total Width:|Rank:|Manufacturer:|Part Number:'
+```
+
+保留所有槽位，包括 `No Module Installed`。重点关注：
+
+- `Configured Memory Speed`：固件报告的配置速率，可能低于标称 `Speed`。
+- `Locator` / `Bank Locator`：用于核对内存条与 CPU、通道的对应关系。
+- `Data Width`：有效数据位宽；`Total Width` 可能包含 ECC 校验位。
+- `Size`、`Rank` 和 `Part Number`：用于确认实际安装配置。
+
+内存条数量不一定等于通道数量。需要结合具体 CPU 和服务器手册确认启用通道数，
+以及这些通道与 NUMA 节点的对应关系，不能只用 DIMM 数或 NUMA 数直接推算。
+
+#### L3 容量及共享 CPU 范围
+
+```bash
+LC_ALL=C lscpu -C
+
+for cache in /sys/devices/system/cpu/cpu*/cache/index*; do
+  [ -r "$cache/level" ] || continue
+  [ "$(cat "$cache/level")" = 3 ] || continue
+  printf 'L3 size=%s shared_cpus=%s\n' \
+    "$(cat "$cache/size")" \
+    "$(cat "$cache/shared_cpu_list")"
+done | sort -u
+```
+
+旧版 `lscpu` 如果不支持 `-C`，使用后面的 sysfs 查询循环即可。
+结合这些结果检查每节点测试工作集是否可能驻留在 L3，再比较实测带宽。
+本程序输出的带宽单位为 GiB/s，换算为 GB/s 时乘以 `1.073741824`。
+
+工具说明：[lscpu](https://man7.org/linux/man-pages/man1/lscpu.1.html)、
+[dmidecode](https://www.nongnu.org/dmidecode/)。`dmidecode` 的信息由固件提供；
+如果字段缺失或不明确，保留原始输出并结合服务器手册核实。
