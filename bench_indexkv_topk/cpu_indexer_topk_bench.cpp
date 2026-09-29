@@ -17,6 +17,7 @@
 #include <iostream>
 #include <limits>
 #include <numeric>
+#include <pthread.h>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -37,6 +38,7 @@ struct Options {
   std::int64_t seq_len = 128 * 1024;
   int heads = 64;
   int dim = 128;
+  int threads = 1;
   int warmup = 3;
   int iters = 10;
   bool check = false;
@@ -58,6 +60,7 @@ struct TimingStats {
       << "  --seq-len N   historical tokens (default: 131072)\n"
       << "  --heads N     index heads (default: 64)\n"
       << "  --dim N       index head dimension (default: 128)\n"
+      << "  --threads N   pthread workers over seq_len (default: 1)\n"
       << "  --warmup N    warmup iterations (default: 3)\n"
       << "  --iters N     measured iterations (default: 10)\n"
       << "  --memory-only stream index-K once with a lightweight XOR reduction\n"
@@ -100,6 +103,9 @@ Options parse_options(int argc, char** argv) {
       options.heads = parse_integer<int>(require_value("--heads"), "heads");
     } else if (arg == "--dim") {
       options.dim = parse_integer<int>(require_value("--dim"), "dim");
+    } else if (arg == "--threads") {
+      options.threads =
+          parse_integer<int>(require_value("--threads"), "threads");
     } else if (arg == "--warmup") {
       options.warmup =
           parse_integer<int>(require_value("--warmup"), "warmup", true);
@@ -494,25 +500,81 @@ void initialize_inputs(std::vector<std::uint16_t>& q,
   }
 }
 
-void compute_scores(const std::vector<std::uint16_t>& q,
-                    const std::vector<std::uint16_t>& index_k,
-                    const std::vector<float>& weights,
-                    std::vector<float>& scores,
-                    int heads,
-                    int dim) {
-  for (std::size_t token = 0; token < scores.size(); ++token) {
-    const std::uint16_t* key = index_k.data() + token * dim;
-    scores[token] =
-        weighted_relu_sum_native(q.data(), key, weights.data(), heads, dim);
+struct WorkerArgs {
+  const std::uint16_t* q;
+  const std::uint16_t* index_k;
+  const float* weights;
+  float* scores;
+  std::size_t token_begin;
+  std::size_t token_end;
+  int heads;
+  int dim;
+  bool memory_only;
+};
+
+void* compute_scores_worker(void* opaque) {
+  const WorkerArgs& args = *static_cast<WorkerArgs*>(opaque);
+  for (std::size_t token = args.token_begin; token < args.token_end; ++token) {
+    const std::uint16_t* key = args.index_k + token * args.dim;
+    if (args.memory_only) {
+      args.scores[token] = static_cast<float>(xor_key_native(key, args.dim));
+    } else {
+      args.scores[token] = weighted_relu_sum_native(
+          args.q, key, args.weights, args.heads, args.dim);
+    }
   }
+  return nullptr;
 }
 
-void compute_memory_scores(const std::vector<std::uint16_t>& index_k,
-                           std::vector<float>& scores,
-                           int dim) {
-  for (std::size_t token = 0; token < scores.size(); ++token) {
-    const std::uint16_t* key = index_k.data() + token * dim;
-    scores[token] = static_cast<float>(xor_key_native(key, dim));
+void compute_scores_parallel(const std::vector<std::uint16_t>& q,
+                             const std::vector<std::uint16_t>& index_k,
+                             const std::vector<float>& weights,
+                             std::vector<float>& scores,
+                             int heads,
+                             int dim,
+                             int requested_threads,
+                             bool memory_only) {
+  const std::size_t worker_count = std::min<std::size_t>(
+      static_cast<std::size_t>(requested_threads), scores.size());
+  const std::size_t tokens_per_worker = scores.size() / worker_count;
+
+  std::vector<pthread_t> workers(worker_count);
+  std::vector<WorkerArgs> args(worker_count);
+  std::size_t created = 0;
+  for (std::size_t worker = 0; worker < worker_count; ++worker) {
+    const std::size_t token_begin = worker * tokens_per_worker;
+    // The final worker also handles seq_len % worker_count tokens.
+    const std::size_t token_end = worker + 1 == worker_count
+                                      ? scores.size()
+                                      : token_begin + tokens_per_worker;
+    args[worker] = {q.data(),
+                    index_k.data(),
+                    weights.data(),
+                    scores.data(),
+                    token_begin,
+                    token_end,
+                    heads,
+                    dim,
+                    memory_only};
+
+    const int error = pthread_create(
+        &workers[worker], nullptr, compute_scores_worker, &args[worker]);
+    if (error != 0) {
+      for (std::size_t join_worker = 0; join_worker < created; ++join_worker) {
+        pthread_join(workers[join_worker], nullptr);
+      }
+      throw std::runtime_error(
+          std::string("pthread_create failed: ") + std::strerror(error));
+    }
+    ++created;
+  }
+
+  for (std::size_t worker = 0; worker < worker_count; ++worker) {
+    const int error = pthread_join(workers[worker], nullptr);
+    if (error != 0) {
+      throw std::runtime_error(
+          std::string("pthread_join failed: ") + std::strerror(error));
+    }
   }
 }
 
@@ -610,13 +672,17 @@ int main(int argc, char** argv) {
     }
     std::cout << "index_k_size_mib=" << std::fixed << std::setprecision(2)
               << (index_k.size() * sizeof(std::uint16_t) / 1048576.0) << "\n";
+    std::cout << "threads=" << options.threads << "\n";
 
     auto run_kernel = [&]() {
-      if (options.memory_only) {
-        compute_memory_scores(index_k, scores, options.dim);
-      } else {
-        compute_scores(q, index_k, weights, scores, options.heads, options.dim);
-      }
+      compute_scores_parallel(q,
+                              index_k,
+                              weights,
+                              scores,
+                              options.heads,
+                              options.dim,
+                              options.threads,
+                              options.memory_only);
     };
 
     for (int i = 0; i < options.warmup; ++i) {

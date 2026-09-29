@@ -21,15 +21,15 @@
 ### CPU DSA indexer score (Arm SVE BF16)
 
 `cpu_indexer_topk_bench.cpp` is a standalone DeepSeek-V3.2 indexer benchmark.
-It computes BF16 index scores with FP32 accumulation on one CPU thread. On Arm
+It computes BF16 index scores with FP32 accumulation using pthread workers. On Arm
 it selects SVE BF16 `BFDOT`, then NEON BF16 `BFDOT`, with a portable scalar
-fallback for build and correctness checks. The benchmark reports the single-core
-score kernel throughput in GFLOPS.
+fallback for build and correctness checks. Tokens are split into contiguous
+`seq_len / threads` ranges; the final worker also handles any remainder.
 
 Build on the target Arm server with native CPU features enabled:
 
 ```bash
-g++ -O3 -std=c++17 -mcpu=native \
+g++ -O3 -std=c++17 -mcpu=native -pthread \
   bench_indexkv_topk/cpu_indexer_topk_bench.cpp \
   -o /tmp/cpu_indexer_score_bench
 ```
@@ -39,7 +39,7 @@ Run the DeepSeek-V3.2 128K configuration:
 ```bash
 /tmp/cpu_indexer_score_bench \
   --seq-len 131072 --heads 64 --dim 128 \
-  --warmup 3 --iters 20 --check
+  --threads 16 --warmup 3 --iters 20 --check
 ```
 
 The first line should report `kernel=Arm SVE BF16 BFDOT`. If it reports the
