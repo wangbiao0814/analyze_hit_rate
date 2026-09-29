@@ -40,6 +40,7 @@ struct Options {
   int warmup = 3;
   int iters = 10;
   bool check = false;
+  bool memory_only = false;
 };
 
 struct TimingStats {
@@ -59,13 +60,14 @@ struct TimingStats {
       << "  --dim N       index head dimension (default: 128)\n"
       << "  --warmup N    warmup iterations (default: 3)\n"
       << "  --iters N     measured iterations (default: 10)\n"
+      << "  --memory-only stream index-K once with a lightweight XOR reduction\n"
       << "  --check       compare the first 256 scores with scalar code\n"
       << "  --help        show this message\n";
   std::exit(error.empty() ? 0 : 2);
 }
 
 template <typename T>
-T parse_integer(const char* text, const char* name) {
+T parse_integer(const char* text, const char* name, bool allow_zero = false) {
   std::size_t consumed = 0;
   const std::string value(text);
   long long parsed = 0;
@@ -74,7 +76,7 @@ T parse_integer(const char* text, const char* name) {
   } catch (const std::exception&) {
     usage("cpu_indexer_topk_bench", std::string("invalid ") + name + ": " + value);
   }
-  if (consumed != value.size() || parsed <= 0 ||
+  if (consumed != value.size() || parsed < (allow_zero ? 0 : 1) ||
       parsed > static_cast<long long>(std::numeric_limits<T>::max())) {
     usage("cpu_indexer_topk_bench", std::string("invalid ") + name + ": " + value);
   }
@@ -99,9 +101,12 @@ Options parse_options(int argc, char** argv) {
     } else if (arg == "--dim") {
       options.dim = parse_integer<int>(require_value("--dim"), "dim");
     } else if (arg == "--warmup") {
-      options.warmup = parse_integer<int>(require_value("--warmup"), "warmup");
+      options.warmup =
+          parse_integer<int>(require_value("--warmup"), "warmup", true);
     } else if (arg == "--iters") {
       options.iters = parse_integer<int>(require_value("--iters"), "iters");
+    } else if (arg == "--memory-only") {
+      options.memory_only = true;
     } else if (arg == "--check") {
       options.check = true;
     } else if (arg == "--help" || arg == "-h") {
@@ -421,6 +426,57 @@ const char* kernel_name() {
 #endif
 }
 
+const char* memory_kernel_name() {
+#if defined(__aarch64__)
+  return "Arm NEON memory-stream XOR";
+#else
+  return "portable memory-stream XOR";
+#endif
+}
+
+std::uint16_t xor_key_scalar(const std::uint16_t* key, int dim) {
+  std::uint16_t result = 0;
+  for (int d = 0; d < dim; ++d) {
+    result ^= key[d];
+  }
+  return result;
+}
+
+#if defined(__aarch64__)
+std::uint16_t xor_key_native(const std::uint16_t* key, int dim) {
+  uint16x8_t accum0 = vdupq_n_u16(0);
+  uint16x8_t accum1 = vdupq_n_u16(0);
+  uint16x8_t accum2 = vdupq_n_u16(0);
+  uint16x8_t accum3 = vdupq_n_u16(0);
+  int d = 0;
+  for (; d + 32 <= dim; d += 32) {
+    accum0 = veorq_u16(accum0, vld1q_u16(key + d));
+    accum1 = veorq_u16(accum1, vld1q_u16(key + d + 8));
+    accum2 = veorq_u16(accum2, vld1q_u16(key + d + 16));
+    accum3 = veorq_u16(accum3, vld1q_u16(key + d + 24));
+  }
+  uint16x8_t accum = veorq_u16(
+      veorq_u16(accum0, accum1), veorq_u16(accum2, accum3));
+  for (; d + 8 <= dim; d += 8) {
+    accum = veorq_u16(accum, vld1q_u16(key + d));
+  }
+
+  const uint64x2_t lanes = vreinterpretq_u64_u16(accum);
+  std::uint64_t folded = vgetq_lane_u64(lanes, 0) ^ vgetq_lane_u64(lanes, 1);
+  folded ^= folded >> 32u;
+  folded ^= folded >> 16u;
+  std::uint16_t result = static_cast<std::uint16_t>(folded);
+  for (; d < dim; ++d) {
+    result ^= key[d];
+  }
+  return result;
+}
+#else
+std::uint16_t xor_key_native(const std::uint16_t* key, int dim) {
+  return xor_key_scalar(key, dim);
+}
+#endif
+
 void initialize_inputs(std::vector<std::uint16_t>& q,
                        std::vector<std::uint16_t>& index_k,
                        std::vector<float>& weights) {
@@ -448,6 +504,15 @@ void compute_scores(const std::vector<std::uint16_t>& q,
     const std::uint16_t* key = index_k.data() + token * dim;
     scores[token] =
         weighted_relu_sum_native(q.data(), key, weights.data(), heads, dim);
+  }
+}
+
+void compute_memory_scores(const std::vector<std::uint16_t>& index_k,
+                           std::vector<float>& scores,
+                           int dim) {
+  for (std::size_t token = 0; token < scores.size(); ++token) {
+    const std::uint16_t* key = index_k.data() + token * dim;
+    scores[token] = static_cast<float>(xor_key_native(key, dim));
   }
 }
 
@@ -499,6 +564,20 @@ void check_scores(const std::vector<std::uint16_t>& q,
   }
 }
 
+void check_memory_scores(const std::vector<std::uint16_t>& index_k,
+                         const std::vector<float>& scores,
+                         int dim) {
+  const std::size_t check_tokens = std::min<std::size_t>(256, scores.size());
+  for (std::size_t token = 0; token < check_tokens; ++token) {
+    const std::uint16_t* key = index_k.data() + token * dim;
+    const float expected = static_cast<float>(xor_key_scalar(key, dim));
+    if (scores[token] != expected) {
+      throw std::runtime_error("memory-only score check failed");
+    }
+  }
+  std::cout << "check_tokens=" << check_tokens << " memory_check=pass\n";
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -516,17 +595,32 @@ int main(int argc, char** argv) {
 
     initialize_inputs(q, index_k, weights);
 
-    std::cout << "kernel=" << kernel_name() << "\n";
+    std::cout << "kernel="
+              << (options.memory_only ? memory_kernel_name() : kernel_name())
+              << "\n";
 #if defined(__ARM_FEATURE_SVE_BF16)
     std::cout << "sve_bits=" << svcntb() * 8 << "\n";
 #endif
-    std::cout << "shape: q=[" << options.heads << ',' << options.dim
-              << "] index_k=[" << options.seq_len << ',' << options.dim << "]\n";
+    if (options.memory_only) {
+      std::cout << "shape: index_k=[" << options.seq_len << ',' << options.dim
+                << "] heads_ignored=" << options.heads << "\n";
+    } else {
+      std::cout << "shape: q=[" << options.heads << ',' << options.dim
+                << "] index_k=[" << options.seq_len << ',' << options.dim << "]\n";
+    }
     std::cout << "index_k_size_mib=" << std::fixed << std::setprecision(2)
               << (index_k.size() * sizeof(std::uint16_t) / 1048576.0) << "\n";
 
+    auto run_kernel = [&]() {
+      if (options.memory_only) {
+        compute_memory_scores(index_k, scores, options.dim);
+      } else {
+        compute_scores(q, index_k, weights, scores, options.heads, options.dim);
+      }
+    };
+
     for (int i = 0; i < options.warmup; ++i) {
-      compute_scores(q, index_k, weights, scores, options.heads, options.dim);
+      run_kernel();
     }
 
     std::vector<double> score_samples;
@@ -534,13 +628,17 @@ int main(int argc, char** argv) {
 
     for (int i = 0; i < options.iters; ++i) {
       const auto score_begin = Clock::now();
-      compute_scores(q, index_k, weights, scores, options.heads, options.dim);
+      run_kernel();
       const auto score_end = Clock::now();
       score_samples.push_back(elapsed_ms(score_begin, score_end));
     }
 
     if (options.check) {
-      check_scores(q, index_k, weights, scores, options.heads, options.dim);
+      if (options.memory_only) {
+        check_memory_scores(index_k, scores, options.dim);
+      } else {
+        check_scores(q, index_k, weights, scores, options.heads, options.dim);
+      }
     }
 
     const TimingStats score_stats = summarize(score_samples);
@@ -554,9 +652,13 @@ int main(int argc, char** argv) {
       std::cout << name << "_ms: min=" << stats.min_ms << " median=" << stats.median_ms
                 << " mean=" << stats.mean_ms << "\n";
     };
-    print_stats("score", score_stats);
-    std::cout << "score_effective_gflops=" << effective_gflops << "\n";
-    std::cout << "unique_index_k_gib_per_s=" << unique_k_gib_per_s << "\n";
+    print_stats(options.memory_only ? "memory_stream" : "score", score_stats);
+    if (options.memory_only) {
+      std::cout << "index_k_read_gib_per_s=" << unique_k_gib_per_s << "\n";
+    } else {
+      std::cout << "score_effective_gflops=" << effective_gflops << "\n";
+      std::cout << "unique_index_k_gib_per_s=" << unique_k_gib_per_s << "\n";
+    }
 
     const double checksum =
         std::accumulate(scores.begin(), scores.end(), 0.0);
