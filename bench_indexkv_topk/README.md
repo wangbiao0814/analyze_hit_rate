@@ -61,3 +61,60 @@ For this mode `heads` is ignored because the unique index-K tensor has shape
 `[seq_len, dim]`. A 128K × 128 BF16 tensor is only 32 MiB and may fit in the
 last-level cache. Use `--warmup 0 --iters 1` for a first-pass measurement;
 warmup iterations intentionally measure the cache-hot path instead.
+
+### Kunpeng DRAM / L3 prefetch ceiling
+
+`numa_dram_prefetch_bench.cpp` measures the sustainable read bandwidth that a
+CPU-side indexer can use. Every pthread is pinned to a selected CPU and
+first-touches its own buffer after pinning. With the normal Linux first-touch
+NUMA policy, selecting CPUs from every NUMA node therefore creates local memory
+traffic on every node instead of making all threads read memory allocated on
+node 0.
+
+Build it on the Kunpeng server:
+
+```bash
+g++ -O3 -std=c++17 -mcpu=native -pthread \
+  bench_indexkv_topk/numa_dram_prefetch_bench.cpp \
+  -o /tmp/numa_dram_prefetch_bench
+```
+
+First inspect the CPU-to-NUMA mapping, then select several physical cores from
+each node (avoid SMT siblings if the machine exposes them):
+
+```bash
+lscpu -e=CPU,NODE,SOCKET,CORE,ONLINE
+numactl --hardware
+
+/tmp/numa_dram_prefetch_bench \
+  --threads 32 \
+  --cpus 0-7,32-39,64-71,96-103 \
+  --buffer-mib 128 \
+  --prefetch-distance 0 \
+  --warmup 1 --iters 10
+```
+
+The aggregate working set should be several times larger than the aggregate L3
+cache. Sweep the software prefetch distance and compare against the zero-distance
+hardware-prefetch baseline:
+
+```bash
+for distance in 0 256 512 1024 2048 4096; do
+  /tmp/numa_dram_prefetch_bench \
+    --threads 32 --cpus 0-7,32-39,64-71,96-103 \
+    --buffer-mib 128 --prefetch-distance "$distance" \
+    --warmup 1 --iters 10
+done
+```
+
+On AArch64, a non-zero distance emits `PRFM PLDL3KEEP`. This instruction is a
+cache-placement hint, so the CPU is allowed to implement it differently; the
+reported value is effective end-to-end streaming bandwidth rather than a pure
+DRAM-to-L3 link measurement.
+
+To judge whether the lightning indexer is memory-bound, compare this benchmark's
+`aggregate_read_gib_per_s` with `cpu_indexer_topk_bench`'s
+`unique_index_k_gib_per_s` at the same thread placement. If the indexer is well
+below the streaming ceiling while CPU execution units are busy, it is not
+limited by unique index-K DRAM bandwidth. A 128K × 128 BF16 index-K is only
+32 MiB, so also compare a cold run (`--warmup 0 --iters 1`) with warmed runs.
