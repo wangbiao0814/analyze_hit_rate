@@ -158,6 +158,38 @@ below the streaming ceiling while CPU execution units are busy, it is not
 limited by unique index-K DRAM bandwidth. A 128K × 128 BF16 index-K is only
 32 MiB, so also compare a cold run (`--warmup 0 --iters 1`) with warmed runs.
 
+### 7280Z NUMA 线程数扫描脚本
+
+`sweep_numa_bandwidth.sh` 用于当前已确认的拓扑：8 个 NUMA 节点，每节点
+80 个逻辑 CPU；node0 为 `0-79`，node1 为 `80-159`，依此类推；相邻编号
+`0/1`、`2/3` 等属于同一物理核。脚本选择偶数编号，每个物理核只使用一个
+SMT 线程，依次测试每节点 `8、16、24、32、40` 个物理核。
+
+先按上面的命令编译 benchmark，然后在项目根目录运行：
+
+```bash
+bash bench_indexkv_topk/sweep_numa_bandwidth.sh
+
+# 也可以传入自己编译的程序路径。
+bash bench_indexkv_topk/sweep_numa_bandwidth.sh /path/to/numa_dram_prefetch_bench
+```
+
+默认每节点分配 1024 MiB，使用 THP，关闭软件预取，预热 3 轮、测量 10 轮。
+完整保留每一组 benchmark 的输出，包括各节点和整机带宽。比较
+`aggregate_read_gib_per_s` 的 `median_time`，找出带宽进入平台期的最小线程数。
+
+可通过环境变量调整参数，或仅预览生成的 CPU 列表和命令：
+
+```bash
+BUFFER_MIB=1024 HUGE_PAGES=2m PREFETCH_DISTANCE=512 WARMUP=3 ITERS=20 \
+  bash bench_indexkv_topk/sweep_numa_bandwidth.sh
+
+DRY_RUN=1 bash bench_indexkv_topk/sweep_numa_bandwidth.sh
+```
+
+显式 HugeTLB 模式仍需要事先配置大页池。脚本使用固定拓扑；换机器时先核对
+`lscpu -e=CPU,NODE,SOCKET,CORE,ONLINE`，不能直接假设偶数 CPU 都对应不同物理核。
+
 ### CPU / DRAM 硬件查询
 
 在 Kunpeng 服务器上执行以下只读命令，保留输出，用于核对 CPU 内存通道规格、
