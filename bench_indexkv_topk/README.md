@@ -72,6 +72,14 @@ allocates one buffer per node, and has that node's workers first-touch and read
 disjoint slices of it. Both modes create node-local memory traffic under the
 normal Linux first-touch policy.
 
+Each worker samples one `uint64_t` every eight elements in its slice
+(`0, 8, 16, ...`, a 64-byte stride), adding the values to a checksum. The load
+is volatile to preserve individual 8-byte reads. The `*_read_gib_per_s` metrics
+use the scanned address span; `*_sampled_gib_per_s` counts only the loaded
+8-byte values and is one eighth of the span bandwidth. Neither metric is a
+hardware measurement of DRAM traffic; cache residency and prefetching affect
+the actual traffic.
+
 Build it on the Kunpeng server:
 
 ```bash

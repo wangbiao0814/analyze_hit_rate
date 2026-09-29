@@ -21,10 +21,6 @@
 #include <unistd.h>
 #include <vector>
 
-#if defined(__aarch64__)
-#include <arm_neon.h>
-#endif
-
 #if !defined(__linux__)
 #error "numa_dram_prefetch_bench requires Linux"
 #endif
@@ -32,6 +28,8 @@
 namespace {
 
 using Clock = std::chrono::steady_clock;
+constexpr std::size_t kElementStride = 8;
+constexpr std::size_t kReadStrideBytes = kElementStride * sizeof(std::uint64_t);
 
 enum class HugePageMode {
   kOff,
@@ -285,47 +283,16 @@ __attribute__((noinline)) std::uint64_t stream_read(
     const std::uint8_t* data,
     std::size_t bytes,
     std::size_t prefetch_distance) {
-  std::size_t offset = 0;
-#if defined(__aarch64__)
-  uint64x2_t accum0 = vdupq_n_u64(0);
-  uint64x2_t accum1 = vdupq_n_u64(0);
-  uint64x2_t accum2 = vdupq_n_u64(0);
-  uint64x2_t accum3 = vdupq_n_u64(0);
-  for (; offset + 64 <= bytes; offset += 64) {
-    if (prefetch_distance != 0 && prefetch_distance < bytes - offset) {
-      prefetch_l3(data + offset + prefetch_distance);
-    }
-    const std::uint64_t* words =
-        reinterpret_cast<const std::uint64_t*>(data + offset);
-    accum0 = veorq_u64(accum0, vld1q_u64(words));
-    accum1 = veorq_u64(accum1, vld1q_u64(words + 2));
-    accum2 = veorq_u64(accum2, vld1q_u64(words + 4));
-    accum3 = veorq_u64(accum3, vld1q_u64(words + 6));
-  }
-  const uint64x2_t accum = veorq_u64(
-      veorq_u64(accum0, accum1), veorq_u64(accum2, accum3));
-  std::uint64_t checksum = vgetq_lane_u64(accum, 0) ^ vgetq_lane_u64(accum, 1);
-#else
+  // Worker slices start at 64-byte boundaries and contain whole cache lines.
+  // One volatile uint64_t load every eight elements prevents widened loads or
+  // elimination of the sampled reads. Unsigned accumulation wraps modulo 2^64.
   std::uint64_t checksum = 0;
-  for (; offset + 64 <= bytes; offset += 64) {
+  for (std::size_t offset = 0; offset + sizeof(std::uint64_t) <= bytes;
+       offset += kReadStrideBytes) {
     if (prefetch_distance != 0 && prefetch_distance < bytes - offset) {
       prefetch_l3(data + offset + prefetch_distance);
     }
-    for (std::size_t lane = 0; lane < 64; lane += sizeof(std::uint64_t)) {
-      std::uint64_t value;
-      std::memcpy(&value, data + offset + lane, sizeof(value));
-      checksum ^= value;
-    }
-  }
-#endif
-  for (; offset + sizeof(std::uint64_t) <= bytes;
-       offset += sizeof(std::uint64_t)) {
-    std::uint64_t value;
-    std::memcpy(&value, data + offset, sizeof(value));
-    checksum ^= value;
-  }
-  for (; offset < bytes; ++offset) {
-    checksum ^= data[offset];
+    checksum += *reinterpret_cast<const volatile std::uint64_t*>(data + offset);
   }
   return checksum;
 }
@@ -664,6 +631,9 @@ int main(int argc, char** argv) {
               << allocation_scope_name(options.allocation_scope) << "\n"
               << "buffer_mib_per_allocation=" << options.buffer_mib << "\n"
               << "allocation_count=" << allocations.size() << "\n"
+              << "element_bytes=" << sizeof(std::uint64_t) << "\n"
+              << "read_stride_elements=" << kElementStride << "\n"
+              << "read_bandwidth_basis=address_span (not measured DRAM traffic)\n"
               << "aggregate_working_set_gib=" << std::fixed
               << std::setprecision(3)
               << aggregate_bytes / static_cast<double>(1ULL << 30) << "\n"
@@ -754,6 +724,11 @@ int main(int argc, char** argv) {
               << "aggregate_read_gib_per_s: min_time="
               << gib / (stats.min_ms / 1000.0)
               << " median_time=" << gib / (stats.median_ms / 1000.0)
+              << "\n"
+              << "aggregate_sampled_gib_per_s: min_time="
+              << gib / kElementStride / (stats.min_ms / 1000.0)
+              << " median_time="
+              << gib / kElementStride / (stats.median_ms / 1000.0)
               << "\n";
     for (std::size_t node_index = 0; node_index < numa_nodes.size(); ++node_index) {
       const TimingStats node_stats = summarize(node_samples[node_index]);
@@ -763,7 +738,13 @@ int main(int argc, char** argv) {
                 << "_read_gib_per_s: min_time="
                 << node_gib / (node_stats.min_ms / 1000.0)
                 << " median_time="
-                << node_gib / (node_stats.median_ms / 1000.0) << "\n";
+                << node_gib / (node_stats.median_ms / 1000.0) << "\n"
+                << "numa_node_" << numa_nodes[node_index]
+                << "_sampled_gib_per_s: min_time="
+                << node_gib / kElementStride / (node_stats.min_ms / 1000.0)
+                << " median_time="
+                << node_gib / kElementStride / (node_stats.median_ms / 1000.0)
+                << "\n";
     }
     std::cout << "checksum=0x" << std::hex << checksum << std::dec << "\n";
     return 0;
