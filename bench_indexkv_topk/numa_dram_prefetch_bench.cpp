@@ -34,6 +34,13 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
+enum class HugePageMode {
+  kOff,
+  kThp,
+  kHugeTlb2M,
+  kHugeTlb1G,
+};
+
 struct Options {
   int threads = 1;
   std::size_t buffer_mib = 256;
@@ -41,7 +48,7 @@ struct Options {
   int warmup = 1;
   int iters = 5;
   std::string cpu_list;
-  bool request_thp = true;
+  HugePageMode huge_pages = HugePageMode::kThp;
 };
 
 struct TimingStats {
@@ -60,9 +67,10 @@ struct TimingStats {
       << "  --cpus LIST              pinned CPUs, e.g. 0-7,32-39\n"
       << "  --buffer-mib N           MiB read by each worker (default: 256)\n"
       << "  --prefetch-distance N    bytes ahead for AArch64 PLDL3KEEP; 0 disables\n"
+      << "  --huge-pages MODE        off, thp, 2m, or 1g (default: thp)\n"
       << "  --warmup N               untimed scans (default: 1)\n"
       << "  --iters N                measured scans (default: 5)\n"
-      << "  --no-thp                 do not request transparent huge pages\n"
+      << "  --no-thp                 alias for --huge-pages off\n"
       << "  --help                   show this message\n";
   std::exit(error.empty() ? 0 : 2);
 }
@@ -105,13 +113,26 @@ Options parse_options(int argc, char** argv) {
     } else if (arg == "--prefetch-distance") {
       options.prefetch_distance = parse_integer<std::size_t>(
           require_value("--prefetch-distance"), "prefetch-distance", true);
+    } else if (arg == "--huge-pages") {
+      const std::string mode = require_value("--huge-pages");
+      if (mode == "off") {
+        options.huge_pages = HugePageMode::kOff;
+      } else if (mode == "thp") {
+        options.huge_pages = HugePageMode::kThp;
+      } else if (mode == "2m") {
+        options.huge_pages = HugePageMode::kHugeTlb2M;
+      } else if (mode == "1g") {
+        options.huge_pages = HugePageMode::kHugeTlb1G;
+      } else {
+        usage(argv[0], "huge-pages must be off, thp, 2m, or 1g");
+      }
     } else if (arg == "--warmup") {
       options.warmup =
           parse_integer<int>(require_value("--warmup"), "warmup", true);
     } else if (arg == "--iters") {
       options.iters = parse_integer<int>(require_value("--iters"), "iters");
     } else if (arg == "--no-thp") {
-      options.request_thp = false;
+      options.huge_pages = HugePageMode::kOff;
     } else if (arg == "--help" || arg == "-h") {
       usage(argv[0]);
     } else {
@@ -126,7 +147,29 @@ Options parse_options(int argc, char** argv) {
   if (options.prefetch_distance % 64 != 0) {
     usage(argv[0], "prefetch-distance must be a multiple of 64 bytes");
   }
+  if (options.huge_pages == HugePageMode::kHugeTlb2M &&
+      options.buffer_mib % 2 != 0) {
+    usage(argv[0], "buffer-mib must be a multiple of 2 for 2 MiB HugeTLB pages");
+  }
+  if (options.huge_pages == HugePageMode::kHugeTlb1G &&
+      options.buffer_mib % 1024 != 0) {
+    usage(argv[0], "buffer-mib must be a multiple of 1024 for 1 GiB HugeTLB pages");
+  }
   return options;
+}
+
+const char* huge_page_mode_name(HugePageMode mode) {
+  switch (mode) {
+    case HugePageMode::kOff:
+      return "off";
+    case HugePageMode::kThp:
+      return "thp";
+    case HugePageMode::kHugeTlb2M:
+      return "hugetlb-2m";
+    case HugePageMode::kHugeTlb1G:
+      return "hugetlb-1g";
+  }
+  return "unknown";
 }
 
 int parse_cpu_number(const std::string& text) {
@@ -264,10 +307,25 @@ struct alignas(64) WorkerState {
   std::uint8_t* buffer = nullptr;
   std::size_t bytes = 0;
   std::size_t prefetch_distance = 0;
+  HugePageMode huge_pages = HugePageMode::kOff;
   int cpu = -1;
   int affinity_error = 0;
+  int allocation_error = 0;
   std::uint64_t checksum = 0;
 };
+
+int huge_page_mmap_flags(HugePageMode mode) {
+  int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+  if (mode == HugePageMode::kHugeTlb2M ||
+      mode == HugePageMode::kHugeTlb1G) {
+    flags |= MAP_HUGETLB;
+    // Linux encodes log2(page_size) in the six bits starting at bit 26.
+    constexpr int kMapHugeShift = 26;
+    const int page_shift = mode == HugePageMode::kHugeTlb2M ? 21 : 30;
+    flags |= page_shift << kMapHugeShift;
+  }
+  return flags;
+}
 
 void* worker_main(void* opaque) {
   WorkerState& worker = *static_cast<WorkerState*>(opaque);
@@ -277,9 +335,27 @@ void* worker_main(void* opaque) {
   worker.affinity_error = pthread_setaffinity_np(
       pthread_self(), sizeof(affinity), &affinity);
 
-  // This write happens after pinning. Under the default Linux memory policy it
-  // physically allocates every page on the NUMA node local to worker.cpu.
-  std::memset(worker.buffer, worker.cpu + 1, worker.bytes);
+  if (worker.affinity_error == 0) {
+    void* mapping = mmap(nullptr,
+                         worker.bytes,
+                         PROT_READ | PROT_WRITE,
+                         huge_page_mmap_flags(worker.huge_pages),
+                         -1,
+                         0);
+    if (mapping == MAP_FAILED) {
+      worker.allocation_error = errno;
+    } else {
+      worker.buffer = static_cast<std::uint8_t*>(mapping);
+      if (worker.huge_pages == HugePageMode::kThp &&
+          madvise(mapping, worker.bytes, MADV_HUGEPAGE) != 0) {
+        worker.allocation_error = errno;
+      } else {
+        // mmap and first touch both happen after pinning. This is important for
+        // per-node HugeTLB pools as well as ordinary anonymous memory.
+        std::memset(worker.buffer, worker.cpu + 1, worker.bytes);
+      }
+    }
+  }
 
   SharedState& shared = *worker.shared;
   pthread_mutex_lock(&shared.mutex);
@@ -361,23 +437,10 @@ int main(int argc, char** argv) {
     std::vector<WorkerState> states(static_cast<std::size_t>(options.threads));
     std::vector<pthread_t> workers(static_cast<std::size_t>(options.threads));
     for (int worker = 0; worker < options.threads; ++worker) {
-      void* mapping = mmap(nullptr,
-                           bytes_per_worker,
-                           PROT_READ | PROT_WRITE,
-                           MAP_PRIVATE | MAP_ANONYMOUS,
-                           -1,
-                           0);
-      if (mapping == MAP_FAILED) {
-        throw std::runtime_error(
-            std::string("mmap failed: ") + std::strerror(errno));
-      }
-      if (options.request_thp) {
-        (void)madvise(mapping, bytes_per_worker, MADV_HUGEPAGE);
-      }
       states[worker].shared = &shared;
-      states[worker].buffer = static_cast<std::uint8_t*>(mapping);
       states[worker].bytes = bytes_per_worker;
       states[worker].prefetch_distance = options.prefetch_distance;
+      states[worker].huge_pages = options.huge_pages;
       states[worker].cpu = cpus[worker];
     }
 
@@ -428,10 +491,18 @@ int main(int argc, char** argv) {
     pthread_mutex_unlock(&shared.mutex);
 
     for (const WorkerState& worker : states) {
-      if (worker.affinity_error != 0) {
-        const std::string message =
-            "failed to pin a worker to CPU " + std::to_string(worker.cpu) +
-            ": " + std::strerror(worker.affinity_error);
+      if (worker.affinity_error != 0 || worker.allocation_error != 0) {
+        std::string message;
+        if (worker.affinity_error != 0) {
+          message =
+              "failed to pin a worker to CPU " + std::to_string(worker.cpu) +
+              ": " + std::strerror(worker.affinity_error);
+        } else {
+          message =
+              "memory allocation failed on CPU " + std::to_string(worker.cpu) +
+              " with huge-pages=" + huge_page_mode_name(worker.huge_pages) +
+              ": " + std::strerror(worker.allocation_error);
+        }
         stop_workers();
         release_buffers();
         pthread_cond_destroy(&shared.condition);
@@ -450,7 +521,8 @@ int main(int argc, char** argv) {
               << "prefetch="
               << (options.prefetch_distance == 0 ? "disabled" : "AArch64 PLDL3KEEP")
               << "\n"
-              << "prefetch_distance_bytes=" << options.prefetch_distance << "\n";
+              << "prefetch_distance_bytes=" << options.prefetch_distance << "\n"
+              << "huge_pages=" << huge_page_mode_name(options.huge_pages) << "\n";
 
     auto run_once = [&]() {
       pthread_mutex_lock(&shared.mutex);

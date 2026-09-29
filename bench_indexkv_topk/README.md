@@ -90,6 +90,7 @@ numactl --hardware
   --threads 32 \
   --cpus 0-7,32-39,64-71,96-103 \
   --buffer-mib 128 \
+  --huge-pages thp \
   --prefetch-distance 0 \
   --warmup 1 --iters 10
 ```
@@ -106,6 +107,31 @@ for distance in 0 256 512 1024 2048 4096; do
     --warmup 1 --iters 10
 done
 ```
+
+The default `--huge-pages thp` mode calls `MADV_HUGEPAGE`. THP is only a hint,
+so it does not prove that the mapping uses huge pages. For guaranteed explicit
+HugeTLB mappings, reserve pages on every NUMA node first and select either 2 MiB
+or 1 GiB pages:
+
+```bash
+grep -E 'HugePages|Hugepagesize|Hugetlb' /proc/meminfo
+
+# Example only: reserve enough 2 MiB pages separately on each node.
+echo 512 | sudo tee \
+  /sys/devices/system/node/node0/hugepages/hugepages-2048kB/nr_hugepages
+
+/tmp/numa_dram_prefetch_bench \
+  --threads 32 --cpus 0-7,32-39,64-71,96-103 \
+  --buffer-mib 128 --huge-pages 2m \
+  --prefetch-distance 512 --warmup 1 --iters 10
+```
+
+Repeat the reservation for every node used by `--cpus`. The total reserved
+capacity on each node must cover the buffers first-touched by workers on that
+node. `--huge-pages 1g` requires `--buffer-mib` to be a multiple of 1024 and
+usually requires 1 GiB pages to have been reserved at boot. Explicit HugeTLB
+allocation fails instead of silently falling back when the node's pool is too
+small. Use `--huge-pages off` to force ordinary pages.
 
 On AArch64, a non-zero distance emits `PRFM PLDL3KEEP`. This instruction is a
 cache-placement hint, so the CPU is allowed to implement it differently; the
