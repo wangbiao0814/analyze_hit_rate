@@ -65,11 +65,12 @@ warmup iterations intentionally measure the cache-hot path instead.
 ### Kunpeng DRAM / L3 prefetch ceiling
 
 `numa_dram_prefetch_bench.cpp` measures the sustainable read bandwidth that a
-CPU-side indexer can use. Every pthread is pinned to a selected CPU and
-first-touches its own buffer after pinning. With the normal Linux first-touch
-NUMA policy, selecting CPUs from every NUMA node therefore creates local memory
-traffic on every node instead of making all threads read memory allocated on
-node 0.
+CPU-side indexer can use. Every pthread is pinned to a selected CPU. The default
+`--allocation-scope thread` gives each worker a private buffer. With
+`--allocation-scope numa`, the program discovers the node of each selected CPU,
+allocates one buffer per node, and has that node's workers first-touch and read
+disjoint slices of it. Both modes create node-local memory traffic under the
+normal Linux first-touch policy.
 
 Build it on the Kunpeng server:
 
@@ -89,21 +90,25 @@ numactl --hardware
 /tmp/numa_dram_prefetch_bench \
   --threads 32 \
   --cpus 0-7,32-39,64-71,96-103 \
-  --buffer-mib 128 \
+  --allocation-scope numa \
+  --buffer-mib 1024 \
   --huge-pages thp \
   --prefetch-distance 0 \
   --warmup 1 --iters 10
 ```
 
-The aggregate working set should be several times larger than the aggregate L3
-cache. Sweep the software prefetch distance and compare against the zero-distance
-hardware-prefetch baseline:
+In NUMA allocation mode, `--buffer-mib` is the size of each node's buffer, not
+each worker's slice. The program reports both aggregate bandwidth and a bandwidth
+line for every detected node. The aggregate working set should be several times
+larger than the aggregate L3 cache. Sweep the software prefetch distance and
+compare against the zero-distance hardware-prefetch baseline:
 
 ```bash
 for distance in 0 256 512 1024 2048 4096; do
   /tmp/numa_dram_prefetch_bench \
     --threads 32 --cpus 0-7,32-39,64-71,96-103 \
-    --buffer-mib 128 --prefetch-distance "$distance" \
+    --allocation-scope numa --buffer-mib 1024 \
+    --prefetch-distance "$distance" \
     --warmup 1 --iters 10
 done
 ```
@@ -122,7 +127,7 @@ echo 512 | sudo tee \
 
 /tmp/numa_dram_prefetch_bench \
   --threads 32 --cpus 0-7,32-39,64-71,96-103 \
-  --buffer-mib 128 --huge-pages 2m \
+  --allocation-scope numa --buffer-mib 1024 --huge-pages 2m \
   --prefetch-distance 512 --warmup 1 --iters 10
 ```
 

@@ -1,8 +1,7 @@
 // Linux/AArch64 streaming-read benchmark for estimating the DRAM bandwidth
-// available to a CPU-side indexer. Each pthread is pinned to one CPU and
-// first-touches its own buffer, so choosing CPUs from multiple NUMA nodes
-// allocates and reads memory locally on those nodes under the default Linux
-// first-touch policy.
+// available to a CPU-side indexer. Each pthread is pinned to one CPU. Buffers
+// can be allocated per worker or per NUMA node; in NUMA mode the workers on a
+// node first-touch and stream disjoint slices of that node's buffer.
 
 #include <algorithm>
 #include <cerrno>
@@ -41,6 +40,11 @@ enum class HugePageMode {
   kHugeTlb1G,
 };
 
+enum class AllocationScope {
+  kThread,
+  kNuma,
+};
+
 struct Options {
   int threads = 1;
   std::size_t buffer_mib = 256;
@@ -49,6 +53,7 @@ struct Options {
   int iters = 5;
   std::string cpu_list;
   HugePageMode huge_pages = HugePageMode::kThp;
+  AllocationScope allocation_scope = AllocationScope::kThread;
 };
 
 struct TimingStats {
@@ -65,7 +70,8 @@ struct TimingStats {
       << "Usage: " << argv0 << " [options]\n"
       << "  --threads N              worker count (default: 1)\n"
       << "  --cpus LIST              pinned CPUs, e.g. 0-7,32-39\n"
-      << "  --buffer-mib N           MiB read by each worker (default: 256)\n"
+      << "  --buffer-mib N           MiB per allocation (default: 256)\n"
+      << "  --allocation-scope MODE  thread or numa (default: thread)\n"
       << "  --prefetch-distance N    bytes ahead for AArch64 PLDL3KEEP; 0 disables\n"
       << "  --huge-pages MODE        off, thp, 2m, or 1g (default: thp)\n"
       << "  --warmup N               untimed scans (default: 1)\n"
@@ -110,6 +116,15 @@ Options parse_options(int argc, char** argv) {
     } else if (arg == "--buffer-mib") {
       options.buffer_mib =
           parse_integer<std::size_t>(require_value("--buffer-mib"), "buffer-mib");
+    } else if (arg == "--allocation-scope") {
+      const std::string scope = require_value("--allocation-scope");
+      if (scope == "thread") {
+        options.allocation_scope = AllocationScope::kThread;
+      } else if (scope == "numa") {
+        options.allocation_scope = AllocationScope::kNuma;
+      } else {
+        usage(argv[0], "allocation-scope must be thread or numa");
+      }
     } else if (arg == "--prefetch-distance") {
       options.prefetch_distance = parse_integer<std::size_t>(
           require_value("--prefetch-distance"), "prefetch-distance", true);
@@ -170,6 +185,10 @@ const char* huge_page_mode_name(HugePageMode mode) {
       return "hugetlb-1g";
   }
   return "unknown";
+}
+
+const char* allocation_scope_name(AllocationScope scope) {
+  return scope == AllocationScope::kNuma ? "numa" : "thread";
 }
 
 int parse_cpu_number(const std::string& text) {
@@ -236,6 +255,24 @@ std::vector<int> allowed_cpus() {
   return cpus;
 }
 
+int numa_node_for_cpu(int cpu) {
+  // Linux exposes node membership as cpuN/nodeM symlinks. A system without
+  // the NUMA sysfs hierarchy is treated as a single-node machine.
+  if (access("/sys/devices/system/node", F_OK) != 0) {
+    return 0;
+  }
+  for (int node = 0; node < CPU_SETSIZE; ++node) {
+    const std::string path = "/sys/devices/system/cpu/cpu" +
+                             std::to_string(cpu) + "/node" +
+                             std::to_string(node);
+    if (access(path.c_str(), F_OK) == 0) {
+      return node;
+    }
+  }
+  throw std::runtime_error(
+      "cannot determine NUMA node for CPU " + std::to_string(cpu));
+}
+
 void prefetch_l3(const void* address) {
 #if defined(__aarch64__)
   asm volatile("prfm pldl3keep, [%0]" : : "r"(address));
@@ -296,22 +333,36 @@ __attribute__((noinline)) std::uint64_t stream_read(
 struct SharedState {
   pthread_mutex_t mutex;
   pthread_cond_t condition;
+  int allocations_ready = 0;
+  int allocation_count = 0;
   int ready = 0;
   int finished = 0;
   std::uint64_t generation = 0;
   bool stop = false;
 };
 
+struct BufferState {
+  std::uint8_t* buffer = nullptr;
+  std::size_t bytes = 0;
+  int node = -1;
+  int worker_count = 0;
+  int allocation_error = 0;
+  HugePageMode huge_pages = HugePageMode::kOff;
+};
+
 struct alignas(64) WorkerState {
   SharedState* shared = nullptr;
+  BufferState* allocation = nullptr;
   std::uint8_t* buffer = nullptr;
   std::size_t bytes = 0;
   std::size_t prefetch_distance = 0;
-  HugePageMode huge_pages = HugePageMode::kOff;
+  std::size_t local_rank = 0;
   int cpu = -1;
+  int node = -1;
   int affinity_error = 0;
-  int allocation_error = 0;
   std::uint64_t checksum = 0;
+  Clock::time_point read_begin;
+  Clock::time_point read_end;
 };
 
 int huge_page_mmap_flags(HugePageMode mode) {
@@ -335,29 +386,56 @@ void* worker_main(void* opaque) {
   worker.affinity_error = pthread_setaffinity_np(
       pthread_self(), sizeof(affinity), &affinity);
 
-  if (worker.affinity_error == 0) {
+  BufferState& allocation = *worker.allocation;
+  if (worker.local_rank == 0 && worker.affinity_error == 0) {
     void* mapping = mmap(nullptr,
-                         worker.bytes,
+                         allocation.bytes,
                          PROT_READ | PROT_WRITE,
-                         huge_page_mmap_flags(worker.huge_pages),
+                         huge_page_mmap_flags(allocation.huge_pages),
                          -1,
                          0);
     if (mapping == MAP_FAILED) {
-      worker.allocation_error = errno;
+      allocation.allocation_error = errno;
     } else {
-      worker.buffer = static_cast<std::uint8_t*>(mapping);
-      if (worker.huge_pages == HugePageMode::kThp &&
-          madvise(mapping, worker.bytes, MADV_HUGEPAGE) != 0) {
-        worker.allocation_error = errno;
-      } else {
-        // mmap and first touch both happen after pinning. This is important for
-        // per-node HugeTLB pools as well as ordinary anonymous memory.
-        std::memset(worker.buffer, worker.cpu + 1, worker.bytes);
+      allocation.buffer = static_cast<std::uint8_t*>(mapping);
+      if (allocation.huge_pages == HugePageMode::kThp &&
+          madvise(mapping, allocation.bytes, MADV_HUGEPAGE) != 0) {
+        allocation.allocation_error = errno;
       }
     }
   }
 
   SharedState& shared = *worker.shared;
+  pthread_mutex_lock(&shared.mutex);
+  if (worker.local_rank == 0) {
+    ++shared.allocations_ready;
+    pthread_cond_broadcast(&shared.condition);
+  }
+  while (!shared.stop &&
+         shared.allocations_ready != shared.allocation_count) {
+    pthread_cond_wait(&shared.condition, &shared.mutex);
+  }
+  if (shared.stop) {
+    pthread_mutex_unlock(&shared.mutex);
+    return nullptr;
+  }
+  pthread_mutex_unlock(&shared.mutex);
+
+  if (worker.affinity_error == 0 && allocation.allocation_error == 0 &&
+      allocation.buffer != nullptr) {
+    const std::size_t cache_lines = allocation.bytes / 64;
+    const std::size_t begin_line =
+        cache_lines * worker.local_rank / allocation.worker_count;
+    const std::size_t end_line =
+        cache_lines * (worker.local_rank + 1) / allocation.worker_count;
+    worker.buffer = allocation.buffer + begin_line * 64;
+    worker.bytes = (end_line - begin_line) * 64;
+
+    // Every worker first-touches its own slice after binding. In NUMA scope all
+    // workers sharing this mapping are on the same node.
+    std::memset(worker.buffer, worker.cpu + 1, worker.bytes);
+  }
+
   pthread_mutex_lock(&shared.mutex);
   ++shared.ready;
   pthread_cond_broadcast(&shared.condition);
@@ -373,9 +451,13 @@ void* worker_main(void* opaque) {
     observed_generation = shared.generation;
     pthread_mutex_unlock(&shared.mutex);
 
-    worker.checksum +=
-        stream_read(worker.buffer, worker.bytes, worker.prefetch_distance) +
-        observed_generation;
+    worker.read_begin = Clock::now();
+    worker.checksum += stream_read(
+                           worker.buffer,
+                           worker.bytes,
+                           worker.prefetch_distance) +
+                       observed_generation;
+    worker.read_end = Clock::now();
 
     pthread_mutex_lock(&shared.mutex);
     ++shared.finished;
@@ -419,14 +501,42 @@ int main(int argc, char** argv) {
     }
     cpus.resize(static_cast<std::size_t>(options.threads));
 
-    const std::size_t bytes_per_worker = options.buffer_mib * 1024ULL * 1024ULL;
-    if (bytes_per_worker >
+    std::vector<int> cpu_nodes;
+    cpu_nodes.reserve(cpus.size());
+    for (int cpu : cpus) {
+      cpu_nodes.push_back(numa_node_for_cpu(cpu));
+    }
+
+    std::vector<int> allocation_nodes;
+    std::vector<std::size_t> allocation_for_worker(cpus.size());
+    if (options.allocation_scope == AllocationScope::kThread) {
+      allocation_nodes = cpu_nodes;
+      for (std::size_t worker = 0; worker < cpus.size(); ++worker) {
+        allocation_for_worker[worker] = worker;
+      }
+    } else {
+      for (std::size_t worker = 0; worker < cpus.size(); ++worker) {
+        auto found = std::find(
+            allocation_nodes.begin(), allocation_nodes.end(), cpu_nodes[worker]);
+        if (found == allocation_nodes.end()) {
+          allocation_nodes.push_back(cpu_nodes[worker]);
+          allocation_for_worker[worker] = allocation_nodes.size() - 1;
+        } else {
+          allocation_for_worker[worker] = static_cast<std::size_t>(
+              found - allocation_nodes.begin());
+        }
+      }
+    }
+
+    const std::size_t bytes_per_allocation =
+        options.buffer_mib * 1024ULL * 1024ULL;
+    if (bytes_per_allocation >
         std::numeric_limits<std::size_t>::max() /
-            static_cast<std::size_t>(options.threads)) {
+            allocation_nodes.size()) {
       throw std::runtime_error("aggregate working set is too large");
     }
     const std::size_t aggregate_bytes =
-        bytes_per_worker * static_cast<std::size_t>(options.threads);
+        bytes_per_allocation * allocation_nodes.size();
 
     SharedState shared;
     if (pthread_mutex_init(&shared.mutex, nullptr) != 0 ||
@@ -434,14 +544,43 @@ int main(int argc, char** argv) {
       throw std::runtime_error("failed to initialize pthread synchronization");
     }
 
+    std::vector<BufferState> allocations(allocation_nodes.size());
+    for (std::size_t allocation = 0; allocation < allocations.size(); ++allocation) {
+      allocations[allocation].bytes = bytes_per_allocation;
+      allocations[allocation].node = allocation_nodes[allocation];
+      allocations[allocation].huge_pages = options.huge_pages;
+    }
+    for (std::size_t allocation : allocation_for_worker) {
+      ++allocations[allocation].worker_count;
+    }
+    shared.allocation_count = static_cast<int>(allocations.size());
+
+    std::vector<int> numa_nodes;
+    for (int node : cpu_nodes) {
+      if (std::find(numa_nodes.begin(), numa_nodes.end(), node) ==
+          numa_nodes.end()) {
+        numa_nodes.push_back(node);
+      }
+    }
+    std::vector<std::size_t> bytes_per_node(numa_nodes.size(), 0);
+    for (const BufferState& allocation : allocations) {
+      const auto found =
+          std::find(numa_nodes.begin(), numa_nodes.end(), allocation.node);
+      bytes_per_node[static_cast<std::size_t>(found - numa_nodes.begin())] +=
+          allocation.bytes;
+    }
+
     std::vector<WorkerState> states(static_cast<std::size_t>(options.threads));
     std::vector<pthread_t> workers(static_cast<std::size_t>(options.threads));
+    std::vector<std::size_t> next_local_rank(allocations.size(), 0);
     for (int worker = 0; worker < options.threads; ++worker) {
+      const std::size_t allocation = allocation_for_worker[worker];
       states[worker].shared = &shared;
-      states[worker].bytes = bytes_per_worker;
+      states[worker].allocation = &allocations[allocation];
       states[worker].prefetch_distance = options.prefetch_distance;
-      states[worker].huge_pages = options.huge_pages;
+      states[worker].local_rank = next_local_rank[allocation]++;
       states[worker].cpu = cpus[worker];
+      states[worker].node = cpu_nodes[worker];
     }
 
     std::size_t created = 0;
@@ -477,9 +616,9 @@ int main(int argc, char** argv) {
     };
 
     auto release_buffers = [&]() {
-      for (const WorkerState& worker : states) {
-        if (worker.buffer != nullptr) {
-          munmap(worker.buffer, worker.bytes);
+      for (const BufferState& allocation : allocations) {
+        if (allocation.buffer != nullptr) {
+          munmap(allocation.buffer, allocation.bytes);
         }
       }
     };
@@ -490,31 +629,41 @@ int main(int argc, char** argv) {
     }
     pthread_mutex_unlock(&shared.mutex);
 
+    std::string initialization_error;
     for (const WorkerState& worker : states) {
-      if (worker.affinity_error != 0 || worker.allocation_error != 0) {
-        std::string message;
-        if (worker.affinity_error != 0) {
-          message =
-              "failed to pin a worker to CPU " + std::to_string(worker.cpu) +
-              ": " + std::strerror(worker.affinity_error);
-        } else {
-          message =
-              "memory allocation failed on CPU " + std::to_string(worker.cpu) +
-              " with huge-pages=" + huge_page_mode_name(worker.huge_pages) +
-              ": " + std::strerror(worker.allocation_error);
-        }
-        stop_workers();
-        release_buffers();
-        pthread_cond_destroy(&shared.condition);
-        pthread_mutex_destroy(&shared.mutex);
-        throw std::runtime_error(
-            message);
+      if (worker.affinity_error != 0) {
+        initialization_error =
+            "failed to pin a worker to CPU " + std::to_string(worker.cpu) +
+            ": " + std::strerror(worker.affinity_error);
+        break;
       }
+    }
+    if (initialization_error.empty()) {
+      for (const BufferState& allocation : allocations) {
+        if (allocation.allocation_error != 0) {
+          initialization_error =
+              "memory allocation failed on NUMA node " +
+              std::to_string(allocation.node) + " with huge-pages=" +
+              huge_page_mode_name(allocation.huge_pages) + ": " +
+              std::strerror(allocation.allocation_error);
+          break;
+        }
+      }
+    }
+    if (!initialization_error.empty()) {
+      stop_workers();
+      release_buffers();
+      pthread_cond_destroy(&shared.condition);
+      pthread_mutex_destroy(&shared.mutex);
+      throw std::runtime_error(initialization_error);
     }
 
     std::cout << "workers=" << options.threads << "\n"
               << "cpus=" << join_cpus(cpus) << "\n"
-              << "buffer_mib_per_worker=" << options.buffer_mib << "\n"
+              << "allocation_scope="
+              << allocation_scope_name(options.allocation_scope) << "\n"
+              << "buffer_mib_per_allocation=" << options.buffer_mib << "\n"
+              << "allocation_count=" << allocations.size() << "\n"
               << "aggregate_working_set_gib=" << std::fixed
               << std::setprecision(3)
               << aggregate_bytes / static_cast<double>(1ULL << 30) << "\n"
@@ -523,6 +672,21 @@ int main(int argc, char** argv) {
               << "\n"
               << "prefetch_distance_bytes=" << options.prefetch_distance << "\n"
               << "huge_pages=" << huge_page_mode_name(options.huge_pages) << "\n";
+    for (std::size_t node_index = 0; node_index < numa_nodes.size(); ++node_index) {
+      std::vector<int> node_cpus;
+      for (std::size_t worker = 0; worker < cpus.size(); ++worker) {
+        if (cpu_nodes[worker] == numa_nodes[node_index]) {
+          node_cpus.push_back(cpus[worker]);
+        }
+      }
+      std::cout << "numa_node_" << numa_nodes[node_index]
+                << "_cpus=" << join_cpus(node_cpus) << "\n"
+                << "numa_node_" << numa_nodes[node_index]
+                << "_working_set_gib="
+                << bytes_per_node[node_index] /
+                       static_cast<double>(1ULL << 30)
+                << "\n";
+    }
 
     auto run_once = [&]() {
       pthread_mutex_lock(&shared.mutex);
@@ -543,8 +707,33 @@ int main(int argc, char** argv) {
     }
     std::vector<double> samples;
     samples.reserve(options.iters);
+    std::vector<std::vector<double>> node_samples(numa_nodes.size());
+    for (std::vector<double>& node_sample : node_samples) {
+      node_sample.reserve(options.iters);
+    }
     for (int i = 0; i < options.iters; ++i) {
       samples.push_back(run_once());
+      for (std::size_t node_index = 0; node_index < numa_nodes.size();
+           ++node_index) {
+        bool first_worker = true;
+        Clock::time_point node_begin;
+        Clock::time_point node_end;
+        for (const WorkerState& worker : states) {
+          if (worker.node != numa_nodes[node_index]) {
+            continue;
+          }
+          if (first_worker || worker.read_begin < node_begin) {
+            node_begin = worker.read_begin;
+          }
+          if (first_worker || worker.read_end > node_end) {
+            node_end = worker.read_end;
+          }
+          first_worker = false;
+        }
+        node_samples[node_index].push_back(
+            std::chrono::duration<double, std::milli>(node_end - node_begin)
+                .count());
+      }
     }
 
     stop_workers();
@@ -565,8 +754,18 @@ int main(int argc, char** argv) {
               << "aggregate_read_gib_per_s: min_time="
               << gib / (stats.min_ms / 1000.0)
               << " median_time=" << gib / (stats.median_ms / 1000.0)
-              << "\n"
-              << "checksum=0x" << std::hex << checksum << std::dec << "\n";
+              << "\n";
+    for (std::size_t node_index = 0; node_index < numa_nodes.size(); ++node_index) {
+      const TimingStats node_stats = summarize(node_samples[node_index]);
+      const double node_gib =
+          bytes_per_node[node_index] / static_cast<double>(1ULL << 30);
+      std::cout << "numa_node_" << numa_nodes[node_index]
+                << "_read_gib_per_s: min_time="
+                << node_gib / (node_stats.min_ms / 1000.0)
+                << " median_time="
+                << node_gib / (node_stats.median_ms / 1000.0) << "\n";
+    }
+    std::cout << "checksum=0x" << std::hex << checksum << std::dec << "\n";
     return 0;
   } catch (const std::exception& error) {
     std::cerr << "fatal: " << error.what() << "\n";
