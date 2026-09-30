@@ -4,6 +4,7 @@
 // node first-touch and stream disjoint slices of that node's buffer.
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
@@ -297,28 +298,50 @@ __attribute__((noinline)) std::uint64_t stream_read(
   return checksum;
 }
 
+static_assert(std::atomic<std::uint64_t>::is_always_lock_free,
+              "benchmark requires lock-free generation counters");
+static_assert(std::atomic<bool>::is_always_lock_free,
+              "benchmark requires lock-free flags");
+
+// Waiting happens only outside stream_read. Occasionally yield to let the
+// controller run even when all available CPUs have pinned workers.
+void spin_wait(std::size_t& polls) {
+#if defined(__aarch64__)
+  asm volatile("yield");
+#elif defined(__x86_64__) || defined(__i386__)
+  asm volatile("pause");
+#endif
+  if (++polls % 4096 == 0) {
+    sched_yield();
+  }
+}
+
 struct SharedState {
-  pthread_mutex_t mutex;
-  pthread_cond_t condition;
-  int allocations_ready = 0;
-  int allocation_count = 0;
-  int ready = 0;
-  int finished = 0;
-  std::uint64_t generation = 0;
-  bool stop = false;
+  alignas(64) std::atomic<std::uint64_t> generation{0};
+  alignas(64) std::atomic<bool> stop{false};
 };
 
 struct BufferState {
+  alignas(64) std::atomic<bool> ready{false};
   std::uint8_t* buffer = nullptr;
   std::size_t bytes = 0;
   int node = -1;
   int worker_count = 0;
   int allocation_error = 0;
   HugePageMode huge_pages = HugePageMode::kOff;
+
+  ~BufferState() {
+    if (buffer != nullptr) {
+      munmap(buffer, bytes);
+    }
+  }
 };
 
 struct alignas(64) WorkerState {
-  SharedState* shared = nullptr;
+  // Completion has a private cache line per worker: no shared RMW counter.
+  alignas(64) std::atomic<std::uint64_t> completed_generation{0};
+  alignas(64) std::atomic<bool> ready{false};
+  alignas(64) SharedState* shared = nullptr;
   BufferState* allocation = nullptr;
   std::uint8_t* buffer = nullptr;
   std::size_t bytes = 0;
@@ -330,6 +353,22 @@ struct alignas(64) WorkerState {
   std::uint64_t checksum = 0;
   Clock::time_point read_begin;
   Clock::time_point read_end;
+};
+
+struct WorkerPool {
+  SharedState& shared;
+  std::vector<pthread_t>& workers;
+  std::size_t created = 0;
+
+  void stop_workers() {
+    shared.stop.store(true, std::memory_order_relaxed);
+    for (std::size_t worker = 0; worker < created; ++worker) {
+      pthread_join(workers[worker], nullptr);
+    }
+    created = 0;
+  }
+
+  ~WorkerPool() { stop_workers(); }
 };
 
 int huge_page_mmap_flags(HugePageMode mode) {
@@ -373,20 +412,17 @@ void* worker_main(void* opaque) {
   }
 
   SharedState& shared = *worker.shared;
-  pthread_mutex_lock(&shared.mutex);
   if (worker.local_rank == 0) {
-    ++shared.allocations_ready;
-    pthread_cond_broadcast(&shared.condition);
+    // Publish allocation success or failure to this buffer's readers.
+    allocation.ready.store(true, std::memory_order_release);
   }
-  while (!shared.stop &&
-         shared.allocations_ready != shared.allocation_count) {
-    pthread_cond_wait(&shared.condition, &shared.mutex);
+  std::size_t polls = 0;
+  while (!allocation.ready.load(std::memory_order_acquire)) {
+    if (shared.stop.load(std::memory_order_relaxed)) {
+      return nullptr;
+    }
+    spin_wait(polls);
   }
-  if (shared.stop) {
-    pthread_mutex_unlock(&shared.mutex);
-    return nullptr;
-  }
-  pthread_mutex_unlock(&shared.mutex);
 
   if (worker.affinity_error == 0 && allocation.allocation_error == 0 &&
       allocation.buffer != nullptr) {
@@ -403,20 +439,22 @@ void* worker_main(void* opaque) {
     std::memset(worker.buffer, worker.cpu + 1, worker.bytes);
   }
 
-  pthread_mutex_lock(&shared.mutex);
-  ++shared.ready;
-  pthread_cond_broadcast(&shared.condition);
-  std::uint64_t observed_generation = shared.generation;
+  std::uint64_t observed_generation = 0;
+  worker.ready.store(true, std::memory_order_release);
   while (true) {
-    while (!shared.stop && shared.generation == observed_generation) {
-      pthread_cond_wait(&shared.condition, &shared.mutex);
+    std::uint64_t next_generation;
+    polls = 0;
+    while ((next_generation = shared.generation.load(std::memory_order_acquire)) ==
+           observed_generation) {
+      if (shared.stop.load(std::memory_order_relaxed)) {
+        return nullptr;
+      }
+      spin_wait(polls);
     }
-    if (shared.stop) {
-      pthread_mutex_unlock(&shared.mutex);
+    if (shared.stop.load(std::memory_order_relaxed)) {
       return nullptr;
     }
-    observed_generation = shared.generation;
-    pthread_mutex_unlock(&shared.mutex);
+    observed_generation = next_generation;
 
     worker.read_begin = Clock::now();
     worker.checksum += stream_read(
@@ -426,9 +464,9 @@ void* worker_main(void* opaque) {
                        observed_generation;
     worker.read_end = Clock::now();
 
-    pthread_mutex_lock(&shared.mutex);
-    ++shared.finished;
-    pthread_cond_broadcast(&shared.condition);
+    // Release publishes timestamps and checksum to the controller.
+    worker.completed_generation.store(observed_generation,
+                                      std::memory_order_release);
   }
 }
 
@@ -506,10 +544,6 @@ int main(int argc, char** argv) {
         bytes_per_allocation * allocation_nodes.size();
 
     SharedState shared;
-    if (pthread_mutex_init(&shared.mutex, nullptr) != 0 ||
-        pthread_cond_init(&shared.condition, nullptr) != 0) {
-      throw std::runtime_error("failed to initialize pthread synchronization");
-    }
 
     std::vector<BufferState> allocations(allocation_nodes.size());
     for (std::size_t allocation = 0; allocation < allocations.size(); ++allocation) {
@@ -520,7 +554,6 @@ int main(int argc, char** argv) {
     for (std::size_t allocation : allocation_for_worker) {
       ++allocations[allocation].worker_count;
     }
-    shared.allocation_count = static_cast<int>(allocations.size());
 
     std::vector<int> numa_nodes;
     for (int node : cpu_nodes) {
@@ -550,51 +583,24 @@ int main(int argc, char** argv) {
       states[worker].node = cpu_nodes[worker];
     }
 
-    std::size_t created = 0;
-    for (; created < workers.size(); ++created) {
+    // This guard joins workers before their state or mappings can be destroyed,
+    // including partial thread creation and initialization failures.
+    WorkerPool pool{shared, workers};
+    for (; pool.created < workers.size(); ++pool.created) {
       const int error = pthread_create(
-          &workers[created], nullptr, worker_main, &states[created]);
+          &workers[pool.created], nullptr, worker_main, &states[pool.created]);
       if (error != 0) {
-        pthread_mutex_lock(&shared.mutex);
-        shared.stop = true;
-        pthread_cond_broadcast(&shared.condition);
-        pthread_mutex_unlock(&shared.mutex);
-        for (std::size_t worker = 0; worker < created; ++worker) {
-          pthread_join(workers[worker], nullptr);
-        }
         throw std::runtime_error(
             std::string("pthread_create failed: ") + std::strerror(error));
       }
     }
 
-    bool workers_stopped = false;
-    auto stop_workers = [&]() {
-      if (workers_stopped) {
-        return;
+    for (WorkerState& worker : states) {
+      std::size_t polls = 0;
+      while (!worker.ready.load(std::memory_order_acquire)) {
+        spin_wait(polls);
       }
-      pthread_mutex_lock(&shared.mutex);
-      shared.stop = true;
-      pthread_cond_broadcast(&shared.condition);
-      pthread_mutex_unlock(&shared.mutex);
-      for (pthread_t worker : workers) {
-        pthread_join(worker, nullptr);
-      }
-      workers_stopped = true;
-    };
-
-    auto release_buffers = [&]() {
-      for (const BufferState& allocation : allocations) {
-        if (allocation.buffer != nullptr) {
-          munmap(allocation.buffer, allocation.bytes);
-        }
-      }
-    };
-
-    pthread_mutex_lock(&shared.mutex);
-    while (shared.ready != options.threads) {
-      pthread_cond_wait(&shared.condition, &shared.mutex);
     }
-    pthread_mutex_unlock(&shared.mutex);
 
     std::string initialization_error;
     for (const WorkerState& worker : states) {
@@ -618,10 +624,6 @@ int main(int argc, char** argv) {
       }
     }
     if (!initialization_error.empty()) {
-      stop_workers();
-      release_buffers();
-      pthread_cond_destroy(&shared.condition);
-      pthread_mutex_destroy(&shared.mutex);
       throw std::runtime_error(initialization_error);
     }
 
@@ -633,6 +635,8 @@ int main(int argc, char** argv) {
               << "allocation_count=" << allocations.size() << "\n"
               << "element_bytes=" << sizeof(std::uint64_t) << "\n"
               << "read_stride_elements=" << kElementStride << "\n"
+              << "synchronization=atomic_generation_per_worker_completion\n"
+              << "aggregate_timing_basis=earliest_read_begin_to_latest_read_end\n"
               << "read_bandwidth_basis=address_span (not measured DRAM traffic)\n"
               << "aggregate_working_set_gib=" << std::fixed
               << std::setprecision(3)
@@ -658,17 +662,19 @@ int main(int argc, char** argv) {
                 << "\n";
     }
 
+    std::uint64_t generation = 0;
     auto run_once = [&]() {
-      pthread_mutex_lock(&shared.mutex);
-      shared.finished = 0;
-      ++shared.generation;
+      ++generation;
       const auto begin = Clock::now();
-      pthread_cond_broadcast(&shared.condition);
-      while (shared.finished != options.threads) {
-        pthread_cond_wait(&shared.condition, &shared.mutex);
+      shared.generation.store(generation, std::memory_order_release);
+      for (WorkerState& worker : states) {
+        std::size_t polls = 0;
+        while (worker.completed_generation.load(std::memory_order_acquire) !=
+               generation) {
+          spin_wait(polls);
+        }
       }
       const auto end = Clock::now();
-      pthread_mutex_unlock(&shared.mutex);
       return std::chrono::duration<double, std::milli>(end - begin).count();
     };
 
@@ -677,12 +683,28 @@ int main(int argc, char** argv) {
     }
     std::vector<double> samples;
     samples.reserve(options.iters);
+    std::vector<double> end_to_end_samples;
+    std::vector<double> start_skew_samples;
+    end_to_end_samples.reserve(options.iters);
+    start_skew_samples.reserve(options.iters);
     std::vector<std::vector<double>> node_samples(numa_nodes.size());
     for (std::vector<double>& node_sample : node_samples) {
       node_sample.reserve(options.iters);
     }
     for (int i = 0; i < options.iters; ++i) {
-      samples.push_back(run_once());
+      end_to_end_samples.push_back(run_once());
+      auto first_begin = states.front().read_begin;
+      auto last_begin = first_begin;
+      auto last_end = states.front().read_end;
+      for (const WorkerState& worker : states) {
+        first_begin = std::min(first_begin, worker.read_begin);
+        last_begin = std::max(last_begin, worker.read_begin);
+        last_end = std::max(last_end, worker.read_end);
+      }
+      samples.push_back(
+          std::chrono::duration<double, std::milli>(last_end - first_begin).count());
+      start_skew_samples.push_back(
+          std::chrono::duration<double, std::milli>(last_begin - first_begin).count());
       for (std::size_t node_index = 0; node_index < numa_nodes.size();
            ++node_index) {
         bool first_worker = true;
@@ -706,21 +728,30 @@ int main(int argc, char** argv) {
       }
     }
 
-    stop_workers();
+    pool.stop_workers();
 
     std::uint64_t checksum = 0;
     for (std::size_t worker = 0; worker < states.size(); ++worker) {
       checksum += states[worker].checksum * (worker + 1);
     }
-    release_buffers();
-    pthread_cond_destroy(&shared.condition);
-    pthread_mutex_destroy(&shared.mutex);
 
     const TimingStats stats = summarize(samples);
+    const TimingStats end_to_end_stats = summarize(end_to_end_samples);
+    const TimingStats start_skew_stats = summarize(start_skew_samples);
     const double gib = aggregate_bytes / static_cast<double>(1ULL << 30);
     std::cout << "stream_ms: min=" << stats.min_ms
               << " median=" << stats.median_ms
               << " mean=" << stats.mean_ms << "\n"
+              << "end_to_end_ms: min=" << end_to_end_stats.min_ms
+              << " median=" << end_to_end_stats.median_ms
+              << " mean=" << end_to_end_stats.mean_ms << "\n"
+              << "worker_start_skew_ms: min=" << start_skew_stats.min_ms
+              << " median=" << start_skew_stats.median_ms
+              << " mean=" << start_skew_stats.mean_ms << "\n"
+              << "aggregate_end_to_end_gib_per_s: min_time="
+              << gib / (end_to_end_stats.min_ms / 1000.0)
+              << " median_time=" << gib / (end_to_end_stats.median_ms / 1000.0)
+              << "\n"
               << "aggregate_read_gib_per_s: min_time="
               << gib / (stats.min_ms / 1000.0)
               << " median_time=" << gib / (stats.median_ms / 1000.0)

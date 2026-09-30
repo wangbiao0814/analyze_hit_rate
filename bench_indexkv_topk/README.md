@@ -80,6 +80,26 @@ use the scanned address span; `*_sampled_gib_per_s` counts only the loaded
 hardware measurement of DRAM traffic; cache residency and prefetching affect
 the actual traffic.
 
+Workers use no mutex or condition variable. An atomic generation number starts
+each scan; each worker publishes completion to its own cache-line-aligned atomic
+flag. The read loop contains no synchronization. Waiting threads spin with CPU
+relax hints and periodically yield, so they still consume CPU time between scans.
+
+Timing output distinguishes the following scopes:
+
+- `stream_ms` and `aggregate_read_gib_per_s`: the earliest worker read start
+  through the latest worker read end, including any stagger between workers.
+- `numa_node_N_read_gib_per_s`: the same read-window definition, restricted to
+  workers on node N. Separate node windows can overlap only partially, so their
+  reported rates must not simply be added.
+- `end_to_end_ms` and `aggregate_end_to_end_gib_per_s`: controller dispatch
+  through observation of all completions, including synchronization overhead.
+- `worker_start_skew_ms`: latest minus earliest worker read start in each scan.
+
+Previously `aggregate_read_gib_per_s` included condition-variable wakeup and
+completion overhead. Compare that older metric with the new
+`aggregate_end_to_end_gib_per_s`, not directly with the new read-window metric.
+
 Build it on the Kunpeng server:
 
 ```bash
