@@ -265,6 +265,28 @@ CORES_PER_NODE=32 CONTROLLER_CPU=78 KERNELS=auto ITERS=200 \
 DRY_RUN=1 bash bench_indexkv_topk/sweep_numa_indexer.sh
 ```
 
+全机用满 320 个物理核（每个物理核只用一个 SMT 线程，CPU 号为偶数）：
+
+```bash
+CORES_PER_NODE=40 CPU_MODE=physical KERNELS="native packed-sve" \
+  SEQ_LEN=20000 bash bench_indexkv_topk/sweep_numa_indexer.sh \
+  /tmp/numa_indexer_bench_sve
+```
+
+全机使用全部 640 个逻辑 CPU，用于比较 SMT 是否有收益：
+
+```bash
+CORES_PER_NODE=40 CPU_MODE=smt KERNELS="native packed-sve" \
+  SEQ_LEN=20000 bash bench_indexkv_topk/sweep_numa_indexer.sh \
+  /tmp/numa_indexer_bench_sve
+```
+
+`CPU_MODE=physical`（默认）为每个 core 选择偶数 CPU；`CPU_MODE=smt` 同时加入相邻
+的奇数 SMT sibling。640 个线程不代表算力翻倍，两个线程共享同一物理核的执行资源；
+对 BF16 密集 kernel 很可能收益有限，甚至因争用变慢，所以应以 `kernel_us` 实测比较。
+全开时没有空闲物理核留给 controller，保持 `CONTROLLER_CPU` 未设置；若需要隔离调度
+线程，应少用一个物理核并把该核留给 controller。
+
 这里每节点 32 核时，CPU 78 所属物理核没有工作线程，可留给调度线程。
 不要把 `CONTROLLER_CPU=78` 用于每节点 40 核的配置，因为那时 CPU 78 已是工作线程。
 默认扫描会显式测试 `packed-sve`；若编译器/CPU 不支持 SVE BF16，请用 `KERNELS=auto`。
