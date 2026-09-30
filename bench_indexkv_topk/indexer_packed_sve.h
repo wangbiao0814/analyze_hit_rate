@@ -19,7 +19,7 @@ inline void pack_query(const std::uint16_t* q, std::uint16_t* packed,
   }
 }
 
-#if defined(__ARM_FEATURE_SVE_BF16)
+#if INDEXER_HAS_SVE_BF16
 inline std::uint32_t key_pair(const std::uint16_t* key, std::size_t d, int dim) {
   // memcpy handles unaligned pairs and the last odd dimension without overread.
   std::uint32_t pair = 0;
@@ -68,7 +68,7 @@ inline void score_range(const std::uint16_t* q, const std::uint16_t* packed_q,
                         float* scores, std::size_t tokens, int heads, int dim,
                         bool use_packed) {
   std::size_t token = 0;
-#if defined(__ARM_FEATURE_SVE_BF16)
+#if INDEXER_HAS_SVE_BF16
   if (use_packed) {
     for (; token + 4 <= tokens; token += 4) {
       score_four_packed_sve(packed_q, keys + token * dim, weights,

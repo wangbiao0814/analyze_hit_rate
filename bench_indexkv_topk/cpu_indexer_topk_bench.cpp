@@ -23,7 +23,7 @@
 #include <vector>
 #include "indexer_bf16_kernels.h"
 
-#if defined(__ARM_FEATURE_SVE_BF16)
+#if INDEXER_HAS_SVE_BF16
 #include <arm_sve.h>
 #endif
 
@@ -355,7 +355,7 @@ int main(int argc, char** argv) {
     std::cout << "kernel="
               << (options.memory_only ? memory_kernel_name() : kernel_name())
               << "\n";
-#if defined(__ARM_FEATURE_SVE_BF16)
+#if INDEXER_HAS_SVE_BF16
     std::cout << "sve_bits=" << svcntb() * 8 << "\n";
 #endif
     if (options.memory_only) {

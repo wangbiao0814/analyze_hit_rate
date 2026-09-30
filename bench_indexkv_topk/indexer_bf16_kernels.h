@@ -1,9 +1,10 @@
 #pragma once
 // Shared BF16 arithmetic for the single-buffer and NUMA indexer benchmarks.
+#include "indexer_features.h"
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
-#if defined(__ARM_FEATURE_SVE_BF16)
+#if INDEXER_HAS_SVE_BF16
 #include <arm_sve.h>
 #endif
 #if defined(__aarch64__)
@@ -49,7 +50,7 @@ inline float dot_bf16_scalar(const std::uint16_t* lhs, const std::uint16_t* rhs,
   return sum;
 }
 
-#if defined(__ARM_FEATURE_SVE_BF16)
+#if INDEXER_HAS_SVE_BF16
 inline float dot_bf16_native(const std::uint16_t* lhs, const std::uint16_t* rhs, int dim) {
   svfloat32_t accum0 = svdup_n_f32(0.0f);
   svfloat32_t accum1 = svdup_n_f32(0.0f);
@@ -127,7 +128,7 @@ inline float dot_bf16_native(const std::uint16_t* lhs, const std::uint16_t* rhs,
 }
 #endif
 
-#if defined(__ARM_FEATURE_SVE_BF16)
+#if INDEXER_HAS_SVE_BF16
 inline float weighted_relu_sum_native(const std::uint16_t* q,
                                const std::uint16_t* key,
                                const float* weights,
@@ -311,7 +312,7 @@ inline float weighted_relu_sum_native(const std::uint16_t* q,
 #endif
 
 inline const char* kernel_name() {
-#if defined(__ARM_FEATURE_SVE_BF16)
+#if INDEXER_HAS_SVE_BF16
   return "Arm SVE BF16 BFDOT";
 #elif defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC)
   return "Arm NEON BF16 BFDOT";
@@ -321,4 +322,3 @@ inline const char* kernel_name() {
 }
 
 }  // namespace indexer
-

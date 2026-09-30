@@ -53,7 +53,7 @@ int main() {
       }
     }
     std::cout << "pass cases=" << cases << " native=" << indexer::kernel_name()
-#if defined(__ARM_FEATURE_SVE_BF16)
+#if INDEXER_HAS_SVE_BF16
               << " packed_sve=executed\n";
 #else
               << " packed_sve=not_available (fallback and packing checked)\n";

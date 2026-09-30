@@ -42,9 +42,15 @@ Run the DeepSeek-V3.2 128K configuration:
   --threads 16 --warmup 3 --iters 20 --check
 ```
 
-The first line should report `kernel=Arm SVE BF16 BFDOT`. If it reports the
-scalar kernel, verify that the compiler supports SVE BF16 and that
-`-mcpu=native` enables `__ARM_FEATURE_SVE_BF16`. The binary prints score timing,
+With SVE BF16 enabled, the first line should report `kernel=Arm SVE BF16 BFDOT`.
+Feature detection is shared in `indexer_features.h`: it accepts
+`__ARM_FEATURE_SVE_BF16`, or, for GCC (not Clang), the combination of
+`__ARM_FEATURE_SVE` and `__ARM_FEATURE_BF16_VECTOR_ARITHMETIC`. Older GCC releases
+can provide the intrinsics without the combined macro; see the
+[GCC 15 release notes](https://gcc.gnu.org/gcc-15/changes.html).
+`__ARM_FEATURE_SVE_BITS=0` is not a reason to disable SVE: the kernels use the
+runtime vector length. If the binary still reports NEON or scalar, check the
+actual compiler flags and executable path. The binary prints score timing,
 effective throughput, memory bandwidth, and a checksum.
 
 To isolate sequential index-K read bandwidth from the BF16 dot-product work,
@@ -275,6 +281,19 @@ g++ -O3 -std=c++17 -mcpu=native \
 本地已验证 portable 数值路径、模拟两节点分片/同步及 SVE 交叉编译；模拟测试不验证
 Linux NUMA 物理页归属，也不代表目标机器的 SVE 执行精度或 128K 性能。
 本地 UBSan 检查通过；ASan 在当前 macOS 环境中初始化失败，因此未完成 ASan 检查。
+
+旧 GCC 特性宏兼容性可在任何带 C++ 编译器的机器上回归检查：
+
+```bash
+bash bench_indexkv_topk/test_indexer_features.sh
+```
+
+该测试只执行预处理，覆盖旧 GCC 缺少组合宏、可变 SVE 长度、NEON-only、SVE-only
+及 Clang 分支；不会把模拟特性宏用于生成可执行文件。
+如果目标 CPU 已确认具有 `svebf16` 和 `bf16`，可用
+`-march=armv8.2-a+sve+bf16` 替代上述 `-mcpu=native`，重新编译数值自测和 benchmark。
+不要手动定义编译器保留的 `__ARM_*` 宏。修复后 `native` 应显示
+`Arm SVE BF16 BFDOT`，`packed-sve` 应显示 `packed SVE BF16 4-token`。
 
 参数和测量口径：
 

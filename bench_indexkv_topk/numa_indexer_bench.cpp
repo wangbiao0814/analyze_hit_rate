@@ -389,7 +389,7 @@ int run(int argc, char** argv) {
   c.options = parse_options(argc, argv);
   const Options& o = c.options;
   const auto cpus = parse_cpus(o.cpus);
-#if defined(__ARM_FEATURE_SVE_BF16)
+#if INDEXER_HAS_SVE_BF16
   c.packed = o.kernel != "native";
 #else
   if (o.kernel == "packed-sve") throw std::runtime_error("packed-sve requires a build with SVE BF16 support");
