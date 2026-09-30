@@ -210,6 +210,104 @@ DRY_RUN=1 bash bench_indexkv_topk/sweep_numa_bandwidth.sh
 显式 HugeTLB 模式仍需要事先配置大页池。脚本使用固定拓扑；换机器时先核对
 `lscpu -e=CPU,NODE,SOCKET,CORE,ONLINE`，不能直接假设偶数 CPU 都对应不同物理核。
 
+### NUMA index-K logits：128K / 75 μs 目标
+
+`numa_indexer_bench.cpp` 将 NUMA 分片和 BF16 打分组合起来：
+
+```text
+logits[s] = sum_h weights[h] * max(dot(q[h, :], index_k[s, :]), 0)
+```
+
+`--seq-len 131072` 是全机的总 token 数。8 个节点均分时，每节点计算 16384 个
+token，持有 4 MiB BF16 K（dim=128），全机 K 共 32 MiB。各节点分别映射 K、Q、
+weights；默认使用 `mbind(MPOL_BIND)` 约束 K/Q/weights 的 NUMA 归属，绑核线程
+初始化自己的 K 分片。所有线程直接写一个连续的 FP32 logits 数组，无需最后归并。
+输出通过绑核线程 first-touch；小规模非整页分片的边界页可能由同节点或相邻节点
+线程共享，默认 128K / 8 节点的输出分界是页对齐的。
+
+线程常驻，读取循环无锁，轮次间使用原子 generation 和独立完成标记。节点之间
+并行，节点内按输出 cache line 分片，处理不能整除的尾部。现有 benchmark 与组合版
+共享 `indexer_bf16_kernels.h`，保留原生 SVE/NEON/portable 路径作为对照。
+
+在目标 Kunpeng 上编译：
+
+```bash
+g++ -O3 -std=c++17 -mcpu=native -pthread \
+  bench_indexkv_topk/numa_indexer_bench.cpp -o /tmp/numa_indexer_bench
+```
+
+每节点 8 个独立物理核的调用示例（按当前 7280Z 编号）：
+
+```bash
+/tmp/numa_indexer_bench \
+  --cpus 0,2,4,6,8,10,12,14,80,82,84,86,88,90,92,94,160,162,164,166,168,170,172,174,240,242,244,246,248,250,252,254,320,322,324,326,328,330,332,334,400,402,404,406,408,410,412,414,480,482,484,486,488,490,492,494,560,562,564,566,568,570,572,574 \
+  --seq-len 131072 --heads 64 --dim 128 \
+  --kernel auto --memory-policy bind --huge-pages thp \
+  --query-mode refresh --warmup 10 --iters 100 --target-us 75 --check
+```
+
+更方便的方式是扫描每节点 `8、16、24、32、40` 个物理核以及两种 kernel：
+
+```bash
+bash bench_indexkv_topk/sweep_numa_indexer.sh
+
+# 只运行每节点 32 核，以及自动选择的 kernel。
+CORES_PER_NODE=32 CONTROLLER_CPU=78 KERNELS=auto ITERS=200 \
+  bash bench_indexkv_topk/sweep_numa_indexer.sh
+
+# 仅查看命令；不分配内存、不运行 benchmark。
+DRY_RUN=1 bash bench_indexkv_topk/sweep_numa_indexer.sh
+```
+
+这里每节点 32 核时，CPU 78 所属物理核没有工作线程，可留给调度线程。
+不要把 `CONTROLLER_CPU=78` 用于每节点 40 核的配置，因为那时 CPU 78 已是工作线程。
+默认扫描会显式测试 `packed-sve`；若编译器/CPU 不支持 SVE BF16，请用 `KERNELS=auto`。
+
+建议先在目标机器运行数值自测（包含奇数 dim、head 尾部及不足 4 个 token）：
+
+```bash
+g++ -O3 -std=c++17 -mcpu=native \
+  bench_indexkv_topk/test_indexer_kernels.cpp -o /tmp/test_indexer_kernels
+/tmp/test_indexer_kernels
+```
+
+支持 SVE BF16 时应显示 `pass cases=200` 和 `packed_sve=executed`。
+本地已验证 portable 数值路径、模拟两节点分片/同步及 SVE 交叉编译；模拟测试不验证
+Linux NUMA 物理页归属，也不代表目标机器的 SVE 执行精度或 128K 性能。
+本地 UBSan 检查通过；ASan 在当前 macOS 环境中初始化失败，因此未完成 ASan 检查。
+
+参数和测量口径：
+
+- `--kernel native`：原有逐 token 的 BF16 kernel。
+- `--kernel packed-sve`：将 Q 按 dimension-pair/head 打包，让 SVE 的 FP32 lane
+  分别累加不同 head；同时处理 4 个 token，复用 Q 加载，最后进行 ReLU、权重求和。
+  要求编译器启用 SVE BF16；不足 4 个 token 的尾部使用 native kernel。
+  `auto` 在支持 SVE BF16 时选它，否则用 native。性能优劣需要在目标机器比较。
+- `--query-mode refresh`（默认）：每轮交替使用两份预生成的不同 Q/weights，
+  节点首线程复制本轮输入到本地并打包 Q，再启动本节点计算。复制、打包、等待都计入
+  `end_to_end_us`。Q 的上游生成过程不计时。
+- `--query-mode static`：Q/weights 和打包结果在初始化时就绪，用于隔离计算性能；
+  不代表每轮新 Q 的实际调用成本。
+- `kernel_us`：全局最早 kernel 开始到最晚 kernel 结束，包含节点启动错开。
+  `end_to_end_us`：主线程发布本轮请求到确认所有连续 logits 可读取。
+  `worker_start_skew_us`：最晚与最早 kernel 启动时间差。三者均输出 min/median/p95/max。
+- `target_end_to_end_p95=pass`：端到端 p95 不超过 `--target-us`；同时输出达标轮数。
+  这不是每一轮都不超过目标的保证，严格上界还要看 max。
+- `--check`：用独立 FP64 reference 校验每线程首/中/尾 token 和全局均匀采样。
+  `--check-all` 检查所有 token。校验在计时结束后进行；所有输出始终检查 finite。
+- `--huge-pages` 作用于 K 映射，支持 off/thp/2m/1g。显式大页会向上对齐映射长度，
+  实际计算和带宽只按真实 token 数统计；`k_mapping_mib` 显示分配容量。
+- `--memory-policy first-touch` 可用于没有 mbind 权限的环境，依赖当前 Linux 内存
+  策略，不能保证严格节点本地性。默认 bind 失败会报错，不自动降级。
+- 可用 `--controller-cpu N` 将调度线程绑定到一个预留物理核；不要选择工作线程的
+  SMT 兄弟核。等待线程会轮询并周期性 yield，因此线程数需要实测调优。
+
+75 μs 是性能目标，并非已在本机验证的结果。默认形状点积部分约为 2.147 GFLOP，
+75 μs 需要约 28.63 TFLOP/s；还不含 ReLU 和权重求和开销。K 初始化、内存分配、
+线程创建和校验均不计入单轮耗时。K 在各轮复用，结果属于 resident/cache-hot 倾向
+的 indexer 测试，不能把 `unique_k_gib_per_s` 当作实测 DRAM 流量。程序只计算 logits，
+不包含 top-k、上游 Q 投影或与设备间的数据传输。
+
 ### CPU / DRAM 硬件查询
 
 在 Kunpeng 服务器上执行以下只读命令，保留输出，用于核对 CPU 内存通道规格、
